@@ -1,0 +1,28 @@
+name: noshare-cover-runner
+
+services:
+  runner:
+    build:
+      context: ..
+      dockerfile: runner/Dockerfile
+    container_name: noshare-cover-ubuntu
+    init: true
+    privileged: true
+    cpus: 8.0
+    cpuset: "0-7"
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      RUNNER_URL: https://github.com/MoonTiwzy/noshare-cover
+      RUNNER_NAME: ubuntu
+      RUNNER_LABELS: ubuntu
+      ACTIONS_RUNNER_HOOK_JOB_COMPLETED: /usr/local/bin/post-job-cleanup.sh
+    volumes:
+      - runner-state:/runner
+      - docker-cache:/var/lib/docker
+
+volumes:
+  runner-state:
+    name: noshare-cover-runner-state
+  docker-cache:
+    name: noshare-cover-docker-cache

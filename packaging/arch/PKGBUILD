@@ -1,0 +1,54 @@
+# noshare-cover for Arch: built against the installed Hyprland.
+# Rebuild the package after updating hyprland: a plugin built against other
+# headers refuses to load (hash check) instead of crashing the compositor.
+pkgname=hyprland-noshare-cover-git
+pkgver=2.0.12
+pkgrel=1
+pkgdesc="Hyprland plugin: image or video instead of the no_screen_share black box"
+arch=('x86_64' 'aarch64')
+url="https://github.com/MoonTiwzy/noshare-cover"
+license=('GPL-3.0-only')
+depends=('hyprland' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'nasm' 'git' 'pkgconf' 'libva' 'mesa')
+optdepends=(
+    'openh264: H.264 decoding on CPU'
+    'libvpx: VP8/VP9 decoding on CPU'
+    'libva: GPU decoding via VA-API (Intel, AMD)'
+    'nvidia-utils: GPU decoding via NVDEC (NVIDIA)'
+)
+provides=('hyprland-noshare-cover')
+conflicts=('hyprland-noshare-cover')
+# NSC_REPO: build from a local clone: NSC_REPO=/path/to/repo makepkg
+source=("noshare-cover::git+${NSC_REPO:-https://github.com/MoonTiwzy/noshare-cover.git}")
+sha256sums=('SKIP')
+options=('!lto' '!debug')
+
+pkgver() {
+    cd noshare-cover
+    printf '2.0.12.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd noshare-cover
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd noshare-cover
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    make
+}
+
+check() {
+    cd noshare-cover
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --release --locked --offline
+}
+
+package() {
+    cd noshare-cover
+    install -Dm755 libnoshare-cover.so "$pkgdir/usr/lib/hyprland/plugins/libnoshare-cover.so"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 include/noshare_cover_api.h "$pkgdir/usr/include/noshare-cover/noshare_cover_api.h"
+}
