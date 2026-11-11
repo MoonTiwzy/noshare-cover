@@ -1,0 +1,65 @@
+[package]
+name = "noshare-cover"
+version = "2.3.1"
+edition = "2024"
+rust-version = "1.89"
+description = "Hyprland plugin: image or video instead of the no_screen_share black box"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+# vaapi-helper: a separate .so (VA-API via cros-codecs), embedded into the plugin
+members = [".", "vaapi-helper"]
+default-members = ["."]
+
+[lib]
+# staticlib is linked into libnoshare-cover.so together with the thin C++ shim (shim/),
+# rlib is for cargo test.
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["nvdec", "vaapi", "cpu-av1", "cpu-h264", "cpu-vpx"]
+# NVIDIA: NVDEC via libcuda/libnvcuvid from the driver (dlopen)
+nvdec = ["dep:libloading"]
+# Intel/AMD (and NVIDIA via nvidia-vaapi-driver): VA-API. The decoder itself lives in
+# vaapi-helper (embedded by the Makefile, loaded from a memfd)
+vaapi = ["dep:libloading"]
+# software fallbacks
+cpu-av1 = ["dep:rav1d"]
+# H.264 on CPU: system libopenh264, dlopen-ed on the first video
+cpu-h264 = ["dep:libloading"]
+# VP8/VP9 on CPU: system libvpx via dlopen
+cpu-vpx = ["dep:libloading"]
+
+[dependencies]
+gif = "0.13"
+libc = "0.2"
+libloading = { version = "0.8", optional = true }
+# Covers: PNG and JPEG straight from their decoders. The image crate on top of them
+# would pull in ICC color management (moxcms), half of the plugin's build time.
+png = "0.18"
+zune-jpeg = "0.5"
+matroska-demuxer = "0.8.1"
+re_mp4 = "0.4.0"
+# AV1 on CPU: dav1d in Rust, asm kernels via nasm (x86_64) / gas (aarch64)
+rav1d = { version = "1.1", optional = true, default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# A panic inside the compositor means a crashed Hyprland. Every C entry point catches
+# panics itself (ffi::guard), so keep unwind, not abort.
+panic = "unwind"
+debug = "line-tables-only"
+
+[profile.dev]
+panic = "unwind"
+
+# cros-codecs 0.0.6 pins cros-libva 0.0.12, which doesn't build against
+# libva 2.23+ (new fields in the VP9 encoder). Local copy with a single fix: vendor/cros-libva.
+[patch.crates-io]
+cros-libva = { path = "vendor/cros-libva" }
+# re_mp4 0.4.0 crashes on MP4 files with PNG cover art in metadata (data type 14)
+re_mp4 = { path = "vendor/re_mp4" }

@@ -1,0 +1,19 @@
+[repository]
+name = "noshare-cover"
+authors = ["MoonTiwzy"]
+# [hyprland commit, noshare-cover commit]: Hyprland 0.56.x builds the last version that supports it.
+commit_pins = [
+    ["36b2e0cfe0c6094dbc47bd42a437431315bb3087", "717ddef2896d7b94e71a4f1c4f6e3513f0da8d7a"], # v0.56.0
+    ["5c9377c15f85c50648f35ca5a213754f95b93ca0", "717ddef2896d7b94e71a4f1c4f6e3513f0da8d7a"], # v0.56.1
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "717ddef2896d7b94e71a4f1c4f6e3513f0da8d7a"], # v0.56.2
+]
+
+[noshare-cover]
+description = "Image or video instead of the no_screen_share black box"
+authors = ["MoonTiwzy"]
+output = "libnoshare-cover.so"
+# requires cargo (rustup or the rust package) in the user's PATH.
+# hyprpm builds in a fresh clone every time and deletes it afterwards; cargo's target
+# directory (~500 MB) is kept in the cache instead, so after a Hyprland update only this
+# repo's own crates and the C++ shim are compiled again, not rav1d and the rest.
+build = ["CARGO_TARGET_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/noshare-cover/target\" make -j$(nproc)"]

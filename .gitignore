@@ -1,0 +1,5 @@
+/target
+*.so
+result
+result-*
+/build/

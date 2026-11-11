@@ -1,0 +1,16 @@
+[package]
+name = "noshare-cover-vaapi"
+version = "2.3.1"
+edition = "2024"
+description = "VA-API decode helper for noshare-cover, loaded at runtime via dlopen"
+license = "GPL-3.0-only"
+publish = false
+
+[lib]
+# Separate .so: only it needs libva/libva-drm/libgbm. The main plugin embeds
+# its bytes and loads it from a memfd; no libva means no VA-API, but the plugin keeps running.
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-codecs = { version = "0.0.6", features = ["vaapi"] }
+libc = "0.2"
