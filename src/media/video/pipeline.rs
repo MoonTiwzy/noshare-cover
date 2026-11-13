@@ -394,7 +394,9 @@ mod tests {
             Box::new(FakeDecoder::default()),
             true,
         );
-        let got: Vec<_> = (0..7).map(|_| pts(p.next_frame().unwrap()).unwrap()).collect();
+        let got: Vec<_> = (0..7)
+            .map(|_| pts(p.next_frame().unwrap()).unwrap())
+            .collect();
         let want = [0, 40, 80, 120, 160, 200, 240].map(ms);
         assert_eq!(got, want, "each pass starts a frame after the last one");
     }
@@ -407,7 +409,9 @@ mod tests {
             Box::new(FakeDecoder::default()),
             true,
         );
-        let got: Vec<_> = (0..4).map(|_| pts(p.next_frame().unwrap()).unwrap()).collect();
+        let got: Vec<_> = (0..4)
+            .map(|_| pts(p.next_frame().unwrap()).unwrap())
+            .collect();
         assert_eq!(got, [0, 40, 80, 120].map(ms), "two frames, then again");
 
         // nothing readable at all is still an error
@@ -458,7 +462,10 @@ mod tests {
         // and when the spare can't be opened either, both reasons are given
         let mut p = Pipeline::new(demux(), Box::new(Refuses), false)
             .with_spare(|_| Err("no libvpx".into()));
-        assert_eq!(p.next_frame().err().as_deref(), Some("10-bit; CPU: no libvpx"));
+        assert_eq!(
+            p.next_frame().err().as_deref(),
+            Some("10-bit; CPU: no libvpx")
+        );
     }
 
     #[test]

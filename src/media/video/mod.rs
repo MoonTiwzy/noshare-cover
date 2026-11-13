@@ -355,7 +355,10 @@ mod tests {
         fn name(&self) -> &'static str {
             "slow"
         }
-        fn decode(&mut self, p: &pipeline::Packet) -> pipeline::PipeResult<Vec<pipeline::DecodedFrame>> {
+        fn decode(
+            &mut self,
+            p: &pipeline::Packet,
+        ) -> pipeline::PipeResult<Vec<pipeline::DecodedFrame>> {
             std::thread::sleep(Duration::from_millis(60));
             self.0.decode(p)
         }
