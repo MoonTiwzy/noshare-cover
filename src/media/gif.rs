@@ -39,6 +39,9 @@ pub struct GifSource {
     sent: Option<usize>,
 }
 
+/// The most a canvas may take (as for a PNG); all the frames together, twice that.
+const MAX_BYTES: u64 = 512 << 20;
+
 impl GifSource {
     pub fn open(path: &Path, speed: f64, looped: bool) -> Result<Self, MediaError> {
         let err = |e: &dyn std::fmt::Display| MediaError::Open {
@@ -57,6 +60,11 @@ impl GifSource {
         if width == 0 || height == 0 {
             return Err(err(&"empty GIF"));
         }
+        // The crate limits a frame's memory, not the canvas the file declares: 65535x65535
+        // is 17 GB, and an allocation that fails takes the compositor down.
+        if u64::from(width) * u64::from(height) * 4 > MAX_BYTES {
+            return Err(err(&format_args!("{width}x{height} is too large")));
+        }
 
         let bg = match (dec.bg_color(), dec.global_palette()) {
             (Some(i), Some(pal)) if i * 3 + 2 < pal.len() => {
@@ -66,7 +74,12 @@ impl GifSource {
         };
 
         let mut frames = Vec::new();
+        let mut held = 0u64;
         while let Some(f) = dec.read_next_frame().map_err(|e| err(&e))? {
+            held += f.buffer.len() as u64;
+            if held > MAX_BYTES * 2 {
+                return Err(err(&"too many large frames"));
+            }
             // Delay is in centiseconds; browsers and the original plugin treat 0 and 1 as 10.
             let cs = if f.delay <= 1 { 10 } else { u64::from(f.delay) };
             frames.push(GifFrame {
@@ -290,6 +303,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nsc-gif-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("t.gif")
+    }
+
+    #[test]
+    fn a_canvas_too_large_to_hold_is_refused() {
+        let p = tmp("huge");
+        // 65535 x 65535 on paper (17 GB as a canvas), one 1x1 frame in the file
+        let mut bytes = b"GIF89a\xff\xff\xff\xff\x80\x00\x00".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 255, 255, 255]); // global palette, 2 colours
+        bytes.extend_from_slice(&[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0]); // image 1x1
+        bytes.extend_from_slice(&[2, 2, 0x44, 0x01, 0]); // LZW: clear, 0, end
+        bytes.push(0x3b);
+        std::fs::write(&p, bytes).unwrap();
+        let err = GifSource::open(&p, 1.0, true).err().expect("refused");
+        assert!(err.to_string().contains("too large"), "{err}");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 
     #[test]

@@ -5,7 +5,9 @@
 //! - global settings change: everything is reset and the epoch is bumped (the
 //!   shim drops its textures on a new epoch);
 //! - file missing: retry once per second, no stat() on every frame;
-//! - failed to open: one notification, no retries until the config changes;
+//! - failed to open: one notification, no retries until the file or the config changes;
+//! - the file changed on disk (looked at once per second, while the cover is shown):
+//!   it is opened again once it has stopped changing;
 //! - cover not shown for a while: the source is closed (for video this stops
 //!   the decode thread) instead of living until the plugin is unloaded.
 //!
@@ -44,6 +46,14 @@ const FIRST_FRAME_WAIT: Duration = Duration::from_secs(2);
 const FIRST_FRAME_STEP: Duration = Duration::from_millis(4);
 /// How soon to look again at a cover that is still being opened.
 const OPENING_STEP: Duration = Duration::from_millis(8);
+
+/// What tells one version of a file from the next: its modification time and length.
+type Stamp = (std::time::SystemTime, u64);
+
+fn stamp_of(path: &std::path::Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
 
 type Loaded = Result<(Box<dyn Source>, Option<Frame>), MediaError>;
 
@@ -190,6 +200,12 @@ struct Cover {
     want: Want,
     /// what the source was last told (see `Want::target`)
     target: (u32, u32),
+    /// the file as it was when it was opened
+    stamp: Option<Stamp>,
+    /// a newer file seen at the last look; opened once it is the same at the next one
+    /// (a file that is still being written keeps changing)
+    changed: Option<Stamp>,
+    look_at: Instant,
 }
 
 /// What the shim draws: a stable cover id (texture cache key) and the frame.
@@ -323,6 +339,7 @@ impl Registry {
 
         if let State::Missing { retry_at } = cover.state {
             if now >= retry_at && play.path.exists() {
+                cover.stamp = stamp_of(&play.path);
                 cover.state = State::Opening {
                     loader: Loader::spawn(
                         self.opener,
@@ -334,6 +351,39 @@ impl Registry {
             } else if now >= retry_at {
                 cover.state = State::Missing {
                     retry_at: now + MISSING_RETRY,
+                };
+            }
+        }
+
+        // A file replaced in place: open the new one. Also after a failed open, which may
+        // have read a file that was only half there.
+        if matches!(cover.state, State::Ready(_) | State::Failed) && now >= cover.look_at {
+            cover.look_at = now + MISSING_RETRY;
+            let seen = stamp_of(&play.path);
+            if seen.is_none() || seen == cover.stamp {
+                cover.changed = None;
+            } else if seen != cover.changed {
+                cover.changed = seen;
+            } else {
+                cover.changed = None;
+                cover.stamp = seen;
+                // A new id: the shim keeps textures by id and frame generation, and the new
+                // source counts its generations (and its video memory buffers) from the start.
+                cover.id = self.next_id;
+                self.next_id += 1;
+                // the old picture stays up until the new one is there, if it is plain pixels
+                let pixels = |f: &Frame| matches!(f.data, crate::frame::FrameData::Cpu(_));
+                if !cover.current.as_ref().is_some_and(pixels) {
+                    cover.current = None;
+                }
+                cover.target = (0, 0);
+                cover.state = State::Opening {
+                    loader: Loader::spawn(
+                        self.opener,
+                        play.clone(),
+                        self.settings.clone().unwrap_or_default(),
+                    ),
+                    retry: false,
                 };
             }
         }
@@ -362,12 +412,14 @@ impl Registry {
                 }
                 Ok(Err(e)) => {
                     self.notifier.push(format!("noshare-cover: {e}"));
+                    cover.current = None; // of the file's earlier version
                     Some(State::Failed)
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.notifier.push(String::from(
                         "noshare-cover: failed to start the cover loader",
                     ));
+                    cover.current = None;
                     Some(State::Failed)
                 }
             };
@@ -432,6 +484,9 @@ impl Registry {
                 last_used: now,
                 want: Want::default(),
                 target: (0, 0),
+                stamp: stamp_of(&play.path),
+                changed: None,
+                look_at: now + MISSING_RETRY,
             },
         );
     }
@@ -458,7 +513,8 @@ impl Registry {
 
     /// When cover `id` will have a new frame to show: zero if it has one now, `None`
     /// if its picture won't change (a still, a video that ended, an error, no such
-    /// cover). The shim repaints by this instead of at a fixed rate.
+    /// cover). The shim repaints by this instead of at a fixed rate. A missing file is
+    /// looked for again by the next resolve, so that one is due when the retry is.
     pub fn next_frame_in(&mut self, id: u64, now: Instant) -> Option<Duration> {
         let cover = self.covers.values_mut().find(|c| c.id == id)?;
         match &mut cover.state {
@@ -469,7 +525,8 @@ impl Registry {
                 OPENING_STEP
             }),
             State::Ready(src) => src.next_frame_in(now),
-            State::Missing { .. } | State::Failed => None,
+            State::Missing { retry_at } => Some(retry_at.saturating_duration_since(now)),
+            State::Failed => None,
         }
     }
 
@@ -503,7 +560,8 @@ impl Registry {
     pub fn animating(&self, now: Instant) -> bool {
         self.covers.values().any(|c| {
             let live = match &c.state {
-                State::Opening { .. } => true,
+                // a missing file may appear: on a still screen nothing else would look
+                State::Opening { .. } | State::Missing { .. } => true,
                 State::Ready(src) => src.kind() != crate::media::Kind::Still,
                 _ => false,
             };
@@ -656,6 +714,49 @@ mod tests {
         let mut r = Registry::with_opener(opener);
         r.set_settings(defaults(), None);
         r
+    }
+
+    #[test]
+    fn a_file_replaced_in_place_is_opened_again_once_it_settles() {
+        let dir = std::env::temp_dir().join(format!("nsc-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("replaced.png");
+        std::fs::write(&file, b"one").unwrap();
+        let path = file.to_str().unwrap();
+        let p = play(path);
+
+        let mut r = reg();
+        settle(&mut r, &p).expect("cover loaded");
+        let id = r.id_of(&p).unwrap();
+        let t = Instant::now();
+
+        // a look a second later: the same file, nothing happens
+        r.begin_frame();
+        r.resolve(&p, (0, 0), t + MISSING_RETRY);
+        assert_eq!(opens(path), 1);
+
+        // the file changes: not opened at the first look (it may still be written)
+        std::fs::write(&file, b"another one").unwrap();
+        r.begin_frame();
+        assert!(r.resolve(&p, (0, 0), t + MISSING_RETRY * 2).is_some());
+        assert_eq!(opens(path), 1);
+        // changed again in between: still waiting
+        std::fs::write(&file, b"another one, longer").unwrap();
+        r.begin_frame();
+        r.resolve(&p, (0, 0), t + MISSING_RETRY * 3);
+        assert_eq!(opens(path), 1);
+        // the same at two looks: opened again, under a new id, the old picture still up
+        r.begin_frame();
+        assert!(
+            r.resolve(&p, (0, 0), t + MISSING_RETRY * 4).is_some(),
+            "the old picture stays until the new one is ready"
+        );
+        settle(&mut r, &p).expect("cover loaded again");
+        assert_eq!(opens(path), 2);
+        assert_ne!(r.id_of(&p), Some(id), "the shim's textures of the old file");
+        assert_eq!(r.len(), 2, "the default cover and this one");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

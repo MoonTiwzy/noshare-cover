@@ -46,6 +46,8 @@ pub(crate) unsafe fn opt_str<'a>(p: *const c_char) -> Option<&'a str> {
 pub struct NscSettings {
     pub path_cover: *const c_char,
     pub looped: bool,
+    /// `path_cover` is an effect ("blur", "transparent"), not a file.
+    pub no_file: bool,
     pub speed: f64,
     pub backend: *const c_char,
     pub gpu_device: *const c_char,
@@ -156,6 +158,7 @@ pub unsafe extern "C" fn nsc_set_settings(s: *const NscSettings) {
         let raw = RawSettings {
             path_cover: unsafe { str_or_empty(s.path_cover) },
             looped: s.looped,
+            no_file: s.no_file,
             speed: s.speed,
             backend: unsafe { str_or_empty(s.backend) },
             gpu_device: unsafe { str_or_empty(s.gpu_device) },
@@ -433,6 +436,7 @@ mod tests {
         let settings = NscSettings {
             path_cover: path.as_ptr(),
             looped: true,
+            no_file: false,
             speed: 1.0,
             backend: backend.as_ptr(),
             gpu_device: std::ptr::null(),

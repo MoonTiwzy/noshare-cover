@@ -23,6 +23,7 @@ extern "C" {
 typedef struct {
     const char* path_cover; /* "" = default file from ~/.config/hypr */
     bool        loop;
+    bool        no_file;    /* path_cover is an effect, not a file: don't look for the default one */
     double      speed;
     const char* backend;    /* "auto" | "gpu" | "cpu" */
     const char* gpu_device; /* "" = the compositor's GPU, or the first render node */

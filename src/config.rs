@@ -65,6 +65,8 @@ impl Default for Settings {
 pub struct RawSettings<'a> {
     pub path_cover: &'a str,
     pub looped: bool,
+    /// The config names an effect instead of a file: there is no default cover at all.
+    pub no_file: bool,
     pub speed: f64,
     pub backend: &'a str,
     pub gpu_device: &'a str,
@@ -87,7 +89,9 @@ impl Settings {
             Backend::Auto
         });
 
-        let path_cover = if raw.path_cover.trim().is_empty() {
+        let path_cover = if raw.no_file {
+            PathBuf::new()
+        } else if raw.path_cover.trim().is_empty() {
             default_media_path()
         } else {
             expand_home(raw.path_cover.trim())
@@ -167,10 +171,11 @@ impl Hash for PlayParams {
     }
 }
 
-/// Speed ≤ 0, NaN and infinity become 1.0.
+/// Speed ≤ 0, NaN and infinity become 1.0; the rest is kept within what the time
+/// arithmetic can take (a `Duration` times 1e300 panics).
 pub fn sanitize_speed(speed: f64) -> f64 {
     if speed.is_finite() && speed > 0.0 {
-        speed
+        speed.clamp(0.01, 100.0)
     } else {
         1.0
     }
@@ -234,6 +239,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn speed_stays_within_what_the_clock_can_take() {
+        assert_eq!(sanitize_speed(1.5), 1.5);
+        assert_eq!(sanitize_speed(1e300), 100.0);
+        assert_eq!(sanitize_speed(1e-25), 0.01);
+        assert_eq!(sanitize_speed(0.0), 1.0);
+        assert_eq!(sanitize_speed(f64::NAN), 1.0);
+        // what used to panic: a duration times such a speed
+        let mut clock = crate::clock::PlaybackClock::new(sanitize_speed(1e300), true);
+        let t = std::time::Instant::now();
+        clock.position(t, None);
+        clock.position(t + std::time::Duration::from_secs(3600 * 24 * 365), None);
+    }
+
+    #[test]
+    fn an_effect_for_a_cover_means_no_default_file() {
+        let raw = RawSettings {
+            no_file: true,
+            ..RawSettings::default()
+        };
+        let (s, err) = Settings::from_raw(&raw);
+        assert_eq!(s.path_cover, PathBuf::new());
+        assert!(err.is_none() || raw.backend.is_empty());
+    }
+
+    #[test]
     fn backend_parse() {
         assert_eq!(Backend::parse(""), Some(Backend::Auto));
         assert_eq!(Backend::parse(" GPU "), Some(Backend::Gpu));
@@ -246,6 +276,7 @@ mod tests {
         let raw = RawSettings {
             path_cover: "/x.gif",
             looped: true,
+            no_file: false,
             speed: 1.0,
             backend: "vulkan",
             gpu_device: "",

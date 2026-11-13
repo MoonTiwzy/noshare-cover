@@ -167,9 +167,10 @@ namespace nsc {
                 continue;
             if (rest.empty())
                 return {kind, def};
-            int n = 0;
+            // "blur 40", and "blur 40.5" or "blur 1e9" too: the strength is whole and has limits
+            double n = 0;
             if (kind != SCoverKind::TRANSPARENT && std::from_chars(rest.data(), rest.data() + rest.size(), n) == std::from_chars_result{rest.data() + rest.size(), std::errc{}})
-                return {kind, std::clamp(n, 2, 512)};
+                return {kind, int(std::clamp(std::round(n), 2.0, 512.0))};
         }
         return {}; // a file, even if it happens to be called "blur x"
     }
@@ -183,8 +184,11 @@ namespace nsc {
             .speed   = g_cfgSpeed ? static_cast<double>(g_cfgSpeed->value()) : 1.0,
             .dev     = g_pushed && g_pushed->dev ? g_pushed->dev : compositorDev(), // the same for the whole session
         };
-        if (coverKind(now.path).kind != SCoverKind::MEDIA)
-            now.path.clear(); // the core never gets the words: such surfaces are never resolved
+        // the core never gets the words: such surfaces are never resolved, and the core
+        // must not open the default file in their place
+        const bool noFile = coverKind(now.path).kind != SCoverKind::MEDIA;
+        if (noFile)
+            now.path.clear();
 
         // This runs for every capture frame, and nearly always nothing changed: then the core
         // isn't asked at all. Once a second it is, though: without path_cover it looks for the
@@ -196,6 +200,7 @@ namespace nsc {
         const nsc_settings s{
             .path_cover = now.path.c_str(),
             .loop       = now.loop,
+            .no_file    = noFile,
             .speed      = now.speed,
             .backend    = now.backend.c_str(),
             .gpu_device = now.gpu.c_str(),
