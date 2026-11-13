@@ -16,6 +16,8 @@ A Hyprland plugin that shows an image, a GIF or a video in place of every
 
 </div>
 
+<p align="center"><img src="docs/preview.webp" alt="The same desktop on your screen and in the stream: the chat is a video there, or gone, or blurred" width="960"></p>
+
 ## What it does
 
 Hyprland can hide a window from screen sharing, and then viewers see a black rectangle where
