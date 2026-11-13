@@ -896,7 +896,12 @@ mod imp {
                             _ => h.timestamp(),
                         };
                         let vf = h.video_frame();
-                        let res = h.display_resolution(); // the frame is the coded size
+                        // The frame is the coded size, and what is shown must lie inside it:
+                        // an AV1 header can name a render size larger than the frame.
+                        let (shown, coded) = (h.display_resolution(), vf.resolution());
+                        let mut res = shown;
+                        res.width = shown.width.min(coded.width);
+                        res.height = shown.height.min(coded.height);
                         // in video memory if asked for and possible; otherwise, and from
                         // the first failure on, through system memory as below
                         let exported = match self.vpp.as_mut().map(|v| v.frame(&vf, res, pts_ns)) {
@@ -926,9 +931,14 @@ mod imp {
                             self.uv.clear();
                             self.uv.extend_from_slice(planes[1]);
                         }
+                        // the plugin reads width x height out of these two planes: never
+                        // more than was copied into them
+                        let fit_w = pitch[0].min(pitch[1]);
+                        let fit_h = (self.y.len() / pitch[0].max(1))
+                            .min(self.uv.len() / pitch[1].max(1) * 2);
                         let f = NscVaFrame {
-                            width: res.width,
-                            height: res.height,
+                            width: res.width.min(u32::try_from(fit_w).unwrap_or(u32::MAX)),
+                            height: res.height.min(u32::try_from(fit_h).unwrap_or(u32::MAX)),
                             y: self.y.as_ptr(),
                             y_stride: pitch[0],
                             uv: self.uv.as_ptr(),

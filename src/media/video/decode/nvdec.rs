@@ -713,7 +713,9 @@ impl State {
 
         let bpp = if self.high_depth { 2 } else { 1 };
         let (w, h) = (self.out_w as usize, self.out_h as usize);
-        let row = w * bpp;
+        // a row of interleaved UV is a pair per two pixels: one byte more than the luma
+        // row when the width is odd (surfaces are padded well past that)
+        let row = w.div_ceil(2) * 2 * bpp;
         let ch = h.div_ceil(2);
         self.host.resize(row * (h + ch), 0);
         // Y, then UV: in video memory UV immediately follows surface_h luma rows

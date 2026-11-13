@@ -197,6 +197,8 @@ pub struct MkvDemux {
     info: VideoInfo,
     framing: Framing,
     frame: matroska_demuxer::Frame,
+    /// nothing read yet since the start of the file
+    first: bool,
 }
 
 impl MkvDemux {
@@ -236,6 +238,7 @@ impl MkvDemux {
             track,
             scale_ns,
             frame: Default::default(),
+            first: true,
             mkv,
         })
     }
@@ -266,12 +269,15 @@ impl Demuxer for MkvDemux {
             if !more {
                 return Ok(None);
             }
-            if self.frame.track != self.track || self.frame.is_invisible {
+            // an invisible frame (a VP8 alt-ref) is decoded like any other, it only has no
+            // picture of its own: left out, every frame that refers to it comes out broken
+            if self.frame.track != self.track {
                 continue;
             }
             let pts = Duration::from_nanos(self.frame.timestamp.saturating_mul(self.scale_ns));
             // is_keyframe is only known for SimpleBlock; otherwise treat the first frame as a keyframe
-            let key = self.frame.is_keyframe.unwrap_or(false);
+            let key = self.frame.is_keyframe.unwrap_or(self.first);
+            self.first = false;
             let data = std::mem::take(&mut self.frame.data);
             if let Some(p) = self.framing.packet(data, pts, key) {
                 return Ok(Some(p));
@@ -280,6 +286,7 @@ impl Demuxer for MkvDemux {
     }
 
     fn rewind(&mut self) -> PipeResult<()> {
+        self.first = true;
         self.mkv.seek(0).map_err(|e| format!("MKV seek: {e}"))
     }
 }

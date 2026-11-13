@@ -19,15 +19,21 @@ use crate::gpu;
 
 pub fn open_pipeline(path: &Path, looped: bool, settings: &Settings) -> Result<Pipeline, String> {
     let demux = open_demuxer(path)?;
-    let decoder = open_decoder(&demux.info().codec, settings)?;
-    Ok(Pipeline::new(demux, decoder, looped))
+    let (decoder, on_gpu) = open_decoder(&demux.info().codec, settings)?;
+    let pipe = Pipeline::new(demux, decoder, looped);
+    Ok(if on_gpu && settings.backend == Backend::Auto {
+        pipe.with_spare(open_sw)
+    } else {
+        pipe
+    })
 }
 
 fn open_demuxer(path: &Path) -> Result<Box<dyn Demuxer>, String> {
     super::demux::open(path)
 }
 
-fn open_decoder(codec: &Codec, settings: &Settings) -> Result<Box<dyn Decoder>, String> {
+/// The decoder, and whether it is a GPU one.
+fn open_decoder(codec: &Codec, settings: &Settings) -> Result<(Box<dyn Decoder>, bool), String> {
     let mut reasons = Vec::new();
 
     if matches!(settings.backend, Backend::Auto | Backend::Gpu) {
@@ -39,7 +45,7 @@ fn open_decoder(codec: &Codec, settings: &Settings) -> Result<Box<dyn Decoder>, 
                     let shared =
                         compositor.is_some() && gpu::device_of_node(&node).as_deref() == compositor;
                     match open_hw(codec, &node, shared) {
-                        Ok(d) => return Ok(d),
+                        Ok(d) => return Ok((d, true)),
                         Err(e) => reasons.push(format!("GPU {}: {e}", node.display())),
                     }
                 }
@@ -52,7 +58,7 @@ fn open_decoder(codec: &Codec, settings: &Settings) -> Result<Box<dyn Decoder>, 
     }
 
     match open_sw(codec) {
-        Ok(d) => Ok(d),
+        Ok(d) => Ok((d, false)),
         Err(e) => {
             reasons.push(format!("CPU: {e}"));
             Err(reasons.join("; "))

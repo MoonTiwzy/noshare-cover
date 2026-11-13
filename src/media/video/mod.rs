@@ -27,6 +27,8 @@ use pipeline::{Next, Pipeline};
 const IDLE_AFTER: Duration = Duration::from_millis(400);
 /// A frame later than this is dropped instead of shown.
 const DROP_LATE: Duration = Duration::from_millis(80);
+/// How many late frames are dropped one after another before playback gives up catching up.
+const LATE_IN_A_ROW: u32 = 3;
 /// "Any moment now": the next frame is still being decoded, or its time has come and the
 /// thread is about to hand it over.
 const SOON: Duration = Duration::from_millis(2);
@@ -203,6 +205,7 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
     let mut target = (0, 0);
     let mut pixels_only = false;
     let mut last_pts: Option<Duration> = None;
+    let mut late = 0u32; // frames dropped in a row
 
     loop {
         // nobody is watching: give back what is only kept between frames (outside the
@@ -264,8 +267,22 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
         };
 
         let (t0, pts0) = *origin.get_or_insert((Instant::now(), frame.pts));
-        let due = t0 + frame.pts.saturating_sub(pts0).div_f64(speed);
+        let mut due = t0 + frame.pts.saturating_sub(pts0).div_f64(speed);
         let now = Instant::now();
+        // Late by more than a frame can be: drop it so we don't fall further behind. But
+        // a decoder that is slower than the video falls behind anyway, and a dropped frame
+        // costs it as much as a shown one: then nothing would ever be shown again. After a
+        // few in a row, go on from this frame, slower than the video.
+        if now.saturating_duration_since(due) > DROP_LATE {
+            late += 1;
+            if late <= LATE_IN_A_ROW {
+                last_pts = Some(frame.pts);
+                continue;
+            }
+            origin = Some((now, frame.pts));
+            due = now;
+        }
+        late = 0;
         // the frame after this one, if the gap stays the same
         let after = last_pts
             .map(|p| frame.pts.saturating_sub(p).div_f64(speed))
@@ -292,8 +309,6 @@ fn run(mut pipe: Pipeline, speed: f64, sync: &Sync) {
             if st.quit {
                 return;
             }
-        } else if now - due > DROP_LATE {
-            continue; // late: drop it so we don't fall further behind
         }
 
         let mut st = sync.lock();
@@ -332,6 +347,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         None
+    }
+
+    /// Takes three times a frame's time to decode it.
+    struct SlowDecoder(FakeDecoder);
+    impl pipeline::Decoder for SlowDecoder {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn decode(&mut self, p: &pipeline::Packet) -> pipeline::PipeResult<Vec<pipeline::DecodedFrame>> {
+            std::thread::sleep(Duration::from_millis(60));
+            self.0.decode(p)
+        }
+        fn flush(&mut self) -> pipeline::PipeResult<Vec<pipeline::DecodedFrame>> {
+            self.0.flush()
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+    }
+
+    #[test]
+    fn a_decoder_slower_than_the_video_still_shows_frames() {
+        let pipe = Pipeline::new(
+            Box::new(FakeDemux::new(1000, Duration::from_millis(20))),
+            Box::new(SlowDecoder(FakeDecoder::default())),
+            true,
+        );
+        let mut s = VideoSource::spawn(pipe, 1.0, "slow".into());
+        // long enough to fall behind by more than DROP_LATE and then some
+        let end = Instant::now() + Duration::from_millis(1500);
+        let mut shown = 0;
+        while Instant::now() < end {
+            if s.poll(Instant::now()).unwrap().is_some() {
+                shown += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // it used to stop for good after the first three or four
+        assert!(shown >= 8, "only {shown} frames in 1.5 s");
     }
 
     #[test]
