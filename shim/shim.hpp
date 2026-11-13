@@ -136,6 +136,14 @@ namespace nsc {
         return w->backend().geometry().box.pos();
     }
 
+    // How far Hyprland draws a window from its position: its workspace sliding in or out
+    // and, for a floating window that reaches past the monitor's edge, the extra shift
+    // that keeps it off the next monitor during that slide (as renderWindow has it).
+    inline Vector2D windowRenderOffset(const PHLWINDOW& w) {
+        const auto where = w->presentation().renderPresentation();
+        return where.workspaceOffset + where.floatingOffset;
+    }
+
     // the layout alpha is how a group hides its inactive tabs
     inline float windowFade(const PHLWINDOW& w) {
         return w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE) * w->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN) *
@@ -315,7 +323,7 @@ namespace nsc {
     extern HANDLE g_handle;
     void          notify(const std::string& msg, float time = 4000);
     // NOSHARE_COVER_DEBUG=<file>: step-by-step trace (for debugging on someone else's machine)
-    extern FILE* const g_trace;
+    extern FILE* g_trace;
     void               drainNotifications();
 
     // config.cpp

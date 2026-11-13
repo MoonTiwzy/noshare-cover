@@ -39,6 +39,8 @@ namespace nsc {
             nsc_shutdown(); // stops and joins decode threads, clears extra rects
             unregisterConfig();
             g_handle = nullptr;
+            if (g_trace)
+                std::fclose(std::exchange(g_trace, nullptr));
         }
 
         PLUGIN_DESCRIPTION_INFO initImpl(HANDLE handle) {
@@ -96,7 +98,7 @@ namespace nsc {
     }
 
     // NOSHARE_COVER_DEBUG=<file>: step-by-step trace (for debugging on someone else's machine)
-    FILE* const g_trace = [] {
+    FILE* g_trace = [] {
         const char* v = std::getenv("NOSHARE_COVER_DEBUG");
         return v && *v ? std::fopen(v, "a") : nullptr;
     }();

@@ -203,10 +203,8 @@ namespace nsc {
     void onWindowClose(const PHLWINDOW& w) {
         if (!w || !w->m_ruleApplicator || !w->m_ruleApplicator->noScreenShare().valueOrDefault())
             return;
-        const auto* ws           = w->m_workspace.get();
-        const auto  renderOffset = ws && !windowPinned(w) && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
-        const auto  pos          = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
-        const auto  size         = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        const auto pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + windowRenderOffset(w);
+        const auto size = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
         startClosing(false, reinterpret_cast<uintptr_t>(w.get()), w->m_monitor.lock(), CBox{pos, size}, ruleValuesFor(w), w->presentation().rounding(), w->presentation().roundingPower());
     }
 

@@ -109,6 +109,10 @@ namespace nsc {
         std::map<std::pair<int, int>, SFxBuffer> g_fxBuffers;
 
         SP<Render::IFramebuffer> fxBuffer(const Vector2D& size, const SP<Render::ITexture>& like) {
+            // a box that changes size every frame (an animation, a resize) asks for new sizes
+            // every frame: don't keep those of earlier frames around for long
+            if (g_fxBuffers.size() > 32)
+                std::erase_if(g_fxBuffers, [](const auto& kv) { return kv.second.used + 1 < g_frameCount; });
             auto& b = g_fxBuffers[{int(size.x), int(size.y)}];
             if (!b.fb)
                 b.fb = g_pHyprRenderer->createFB("noshare-cover effect");
@@ -132,7 +136,10 @@ namespace nsc {
             const Vector2D target{std::max(1.0, std::round(src.w / kind.amount)), std::max(1.0, std::round(src.h / kind.amount))};
             // first to target * 2^k, the nearest such size to src, so that every halving after it
             // is exact: one pixel from 2x2
-            const int             k = std::clamp(int(std::lround(std::log2(std::max(src.w / target.x, src.h / target.y)))), 0, 12);
+            int k = std::clamp(int(std::lround(std::log2(std::max(src.w / target.x, src.h / target.y)))), 0, 12);
+            // never a buffer larger than the image: a zoomed box is several times the screen
+            while (k > 0 && (target.x * (1 << k) > image->m_size.x || target.y * (1 << k) > image->m_size.y))
+                --k;
             std::vector<Vector2D> steps;
             for (int i = k; i >= 0; --i)
                 steps.push_back(target * double(1 << i));
@@ -305,7 +312,7 @@ namespace nsc {
 
                 if (r.fill == 1) {
                     if (const auto tex = coverForWindowAddress(r.window, box.size())) {
-                        g_painted.add(box);
+                        drawBlack(ctx, box, round); // under the cover's transparent pixels
                         g_pHyprRenderer->draw(ctx, CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round}, box);
                         continue;
                     }
@@ -453,7 +460,8 @@ namespace nsc {
                 cover            = f.cover_id; // also while it is still being opened
                 if (const auto tex = ready ? textureFor(f) : nullptr) {
                     NSC_TRACE("%s: cover %ux%u at %.0f,%.0f %.0fx%.0f\n", what.c_str(), f.width, f.height, box.x, box.y, box.w, box.h);
-                    g_painted.add(area);
+                    // black first: a picture with transparent pixels would show the window through them
+                    drawBlack(ctx, box, round, roundingPower, area);
                     g_pHyprRenderer->draw(ctx, CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round, .roundingPower = roundingPower}, area);
                     return cover;
                 }
@@ -485,9 +493,8 @@ namespace nsc {
             return std::nullopt;
 
         SWinGeo    g;
-        const auto renderOffset = ws && !windowPinned(w) && ws->m_renderOffset ? ws->m_renderOffset->value() : Vector2D{};
-        g.size                  = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-        g.pos                   = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + renderOffset;
+        g.size = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        g.pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + windowRenderOffset(w);
         g.box = zoomed(mon, CBox{g.pos.x, g.pos.y, std::max(g.size.x, 5.0), std::max(g.size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
         if (g.box.w < 1 || g.box.h < 1)
             return std::nullopt;
@@ -592,8 +599,13 @@ namespace nsc {
         };
         std::vector<std::pair<size_t, CRegion>> drawn; // covers (or black) drawn, per window
 
+        // bottom to top, as Hyprland stacks them: where two covers overlap, the upper one stays
+        std::vector<size_t> order(visible.size());
+        std::iota(order.begin(), order.end(), size_t{0});
+        std::ranges::stable_sort(order, {}, [&](size_t k) { return visible[k].geo.layer; });
+
         std::unordered_set<uintptr_t> seen;
-        for (size_t i = 0; i < visible.size(); ++i) {
+        for (const size_t i : order) {
             if (!visible[i].rules)
                 continue;
             const auto& w             = visible[i].w;
@@ -654,9 +666,6 @@ namespace nsc {
         // cover, so what shows through them (blurred, if they blur) is the cover and never
         // the hidden window. Only over covers below them, minus whatever is above them.
         if (!drawn.empty()) {
-            std::vector<size_t> order(visible.size());
-            std::iota(order.begin(), order.end(), size_t{0});
-            std::ranges::stable_sort(order, {}, [&](size_t k) { return visible[k].geo.layer; });
             for (const size_t j : order) {
                 // Never redraw a hidden window from its real content. This also catches
                 // windows that are only translucent for a moment (fading in on open).
@@ -692,7 +701,7 @@ namespace nsc {
         // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's
         // black rect, no rounding.
         for (const auto& l : Desktop::layerState()->layers()) {
-            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !viewVisible(l))
+            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !viewVisible(l) || l->m_monitor.lock() != mon)
                 continue;
             const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
             const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
