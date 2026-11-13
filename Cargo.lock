@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "noshare-cover"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "gif",
  "libc",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "noshare-cover-vaapi"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "cros-codecs",
  "libc",

@@ -30,7 +30,7 @@
         pkgs.hyprlandPlugins.mkHyprlandPlugin {
           hyprland = hyprlandPkg;
           pluginName = "noshare-cover";
-          version = "2.3.1";
+          version = "2.3.2";
           src = self;
 
           # Rust deps from Cargo.lock, no network needed in the sandbox
