@@ -5,9 +5,12 @@
 //! - global settings change: everything is reset and the epoch is bumped (the
 //!   shim drops its textures on a new epoch);
 //! - while a cover is shown its file is looked at once per second, no stat() on every
-//!   frame (see `look`): a missing file is opened once it is there, a file replaced on
-//!   disk once it has stopped changing;
-//! - failed to open: one notification, no retries until the file or the config changes;
+//!   frame (see `look`): a missing file that is there now, or a file replaced on disk, is
+//!   opened once it has stopped changing;
+//! - failed to open, or a video failed later: one notification, no retries until the file
+//!   or the config changes. No notification when the file changed since it was opened (it
+//!   is still being written, or was written over in place): it is opened again once it has
+//!   stopped changing;
 //! - cover not shown for a while: the source is closed (for video this stops
 //!   the decode thread) instead of living until the plugin is unloaded.
 //!
@@ -265,11 +268,12 @@ struct Cover {
     /// A source of this cover was opened before: the shim may still hold textures of it
     /// under `id`, so the next one gets a new id (see `resolve`).
     had_source: bool,
-    /// The id before that: the shim asks by the id it last drew the cover with, and on
-    /// another monitor that frame may have come before the new id. A box asked about by it
-    /// still shows the earlier picture: it is due now (see `next_frame_in`).
-    earlier_id: Option<u64>,
-    /// the file as it was when it was opened
+    /// The id it was given first. The shim asks by the id it last drew the cover with, and
+    /// on another monitor that frame may have come before one or more new ids. A box asked
+    /// about by any of the earlier ones still shows an earlier picture: it is due now (see
+    /// `next_frame_in`).
+    first_id: u64,
+    /// the file as it was before its source began to be opened (see `written_over`)
     stamp: Option<Stamp>,
     /// a newer file seen at the last look; opened once it is the same at the next one
     /// (a file that is still being written keeps changing)
@@ -281,6 +285,28 @@ struct Cover {
 impl Cover {
     fn look_due(&self, now: Instant) -> bool {
         !matches!(self.state, State::Opening { .. }) && now >= self.look_at
+    }
+
+    /// The file at `path` is another one than the source was opened from, or than its open
+    /// began with: it may still be being written (a file copied in, an encoder writing
+    /// straight to it), and what failed on it is no error of the file's. `look` opens it
+    /// again once it stops changing, and that open reports what is wrong with it. A file
+    /// that is gone is never looked at again: its error is reported.
+    fn written_over(&self, path: &std::path::Path) -> bool {
+        stamp_of(path).is_some_and(|seen| Some(seen) != self.stamp)
+    }
+
+    /// Its source failed, or failed to open, on a file `written_over`: nothing is reported,
+    /// the picture stays if it is plain pixels (one in video memory goes with its source),
+    /// and the file is looked at right away. Nothing is open from it now: whatever the
+    /// file is next, also the one opened before put back as it was, is opened once it
+    /// stops changing.
+    fn wait_for_the_file(&mut self, now: Instant) {
+        if !self.current.as_ref().is_some_and(in_memory) {
+            self.current = None;
+        }
+        self.stamp = None;
+        self.look_at = now;
     }
 }
 
@@ -411,7 +437,6 @@ impl Registry {
                     // after an earlier one it gets a new id. The id changes only here, with
                     // the picture: the shim asks about the cover by the id it last drew.
                     if cover.had_source {
-                        cover.earlier_id = Some(cover.id);
                         cover.id = self.next_id;
                         self.next_id += 1;
                         // the earlier picture, until the first frame is there, under a
@@ -432,7 +457,15 @@ impl Registry {
                             .push(format!("noshare-cover: file not found: {p}"));
                     }
                     cover.look_at = now + LOOK_EVERY;
+                    cover.changed = None; // see `look`
                     Some(State::Missing)
+                }
+                // Opened while it was still being written: a cover is opened at once when
+                // it is first asked for (the default file the moment it is there, one a
+                // window rule names), and a file may change again while it is opened.
+                Ok(Err(_)) if cover.written_over(&play.path) => {
+                    cover.wait_for_the_file(now);
+                    Some(State::Failed)
                 }
                 Ok(Err(e)) => {
                     self.notifier.push(format!("noshare-cover: {e}"));
@@ -465,10 +498,16 @@ impl Registry {
                     Ok(Some(f)) => cover.current = Some(f),
                     Ok(None) => {}
                     Err(e) => {
-                        self.notifier.push(format!("noshare-cover: {e}"));
                         let old = std::mem::replace(&mut cover.state, State::Failed);
                         self.retired.state(old);
-                        cover.current = None;
+                        // a video reads its file as it plays: one written over in place
+                        // breaks it, and that is no error of the new file's
+                        if cover.written_over(&play.path) {
+                            cover.wait_for_the_file(now);
+                        } else {
+                            self.notifier.push(format!("noshare-cover: {e}"));
+                            cover.current = None;
+                        }
                     }
                 }
             }
@@ -483,10 +522,13 @@ impl Registry {
 
     /// Looks at the file of a shown cover, at most once per `LOOK_EVERY`: from a capture
     /// frame (`resolve`), and on a still screen, where none comes, from the shim's question
-    /// when the cover changes next (`next_frame_in`). A missing file that is there now is
-    /// opened; so is a file replaced on disk once it is the same at two looks in a row, also
-    /// after a failed open, which may have read a file that was only half there. The cover
-    /// keeps its id and its picture until the new source is there (see `resolve`).
+    /// when the cover changes next (`next_frame_in`). A missing file that is there now, and
+    /// a file replaced on disk, are opened once they are the same at two looks in a row: one
+    /// that is still being copied or written would fail to open, and that would be reported.
+    /// A replaced file is also opened again after its source failed: an open may have read
+    /// a file that was only half there, and a video breaks on a file written over in place
+    /// (if the file changed since, that wasn't reported, see `Cover::written_over`). The
+    /// cover keeps its id and its picture until the new source is there (see `resolve`).
     fn look(&mut self, play: &PlayParams, now: Instant) {
         let Some(cover) = self.covers.get_mut(play) else {
             return;
@@ -496,10 +538,12 @@ impl Registry {
         }
         cover.look_at = now + LOOK_EVERY;
         let retry = if matches!(cover.state, State::Missing) {
-            if !play.path.exists() {
+            let seen = stamp_of(&play.path);
+            if seen.is_none() || seen != cover.changed {
+                cover.changed = seen;
                 return;
             }
-            cover.stamp = stamp_of(&play.path);
+            (cover.changed, cover.stamp) = (None, seen);
             true
         } else {
             let seen = stamp_of(&play.path);
@@ -542,6 +586,8 @@ impl Registry {
         let id = self.next_id;
         self.next_id += 1;
         let settings = self.settings.clone().unwrap_or_default();
+        // the file as it is before the loader thread can read it (see `Cover::written_over`)
+        let stamp = stamp_of(&play.path);
         let state = State::Opening {
             loader: Loader::spawn(self.opener, play.clone(), settings),
             retry: false,
@@ -557,8 +603,8 @@ impl Registry {
                 want: Want::default(),
                 target: (0, 0),
                 had_source: false,
-                earlier_id: None,
-                stamp: stamp_of(&play.path),
+                first_id: id,
+                stamp,
                 changed: None,
                 look_at: now + LOOK_EVERY,
             },
@@ -589,11 +635,15 @@ impl Registry {
     /// a fixed rate. A cover whose picture doesn't change by itself (a still, a video that
     /// ended, a missing or broken file) is due when its file is looked at next: on a still
     /// screen this question is what looks at it, and only a new picture makes it zero.
-    /// Asked by the id the cover had before its new source, it is zero at once: that box is
-    /// on a monitor not drawn since the source came, so it shows the earlier picture, and
-    /// its repaint draws the new one under the new id. `None`: no such cover.
+    /// Asked by an id the cover had before its newer sources, it is zero at once: that box
+    /// is on a monitor not drawn since then, so it shows an earlier picture, and its repaint
+    /// draws the current one under the current id. `None`: no such cover.
     pub fn next_frame_in(&mut self, id: u64, now: Instant) -> Option<Duration> {
-        let asked = |c: &Cover| c.id == id || c.earlier_id == Some(id);
+        // Ids come from one counter for all covers: between a cover's first id and its
+        // current one there are other covers' ids. The cover that has the id now is the one
+        // asked about.
+        let now_has = self.covers.values().any(|c| c.id == id);
+        let asked = |c: &Cover| c.id == id || (!now_has && (c.first_id..c.id).contains(&id));
         let (play, cover) = self.covers.iter().find(|(_, c)| asked(c))?;
         if cover.look_due(now) {
             let play = play.clone();
@@ -738,6 +788,41 @@ mod tests {
         }
     }
 
+    /// A clip read as it plays, the way a video's thread reads its file: its first frame
+    /// (the pixel is the file's first byte), then nothing new while the file is the one it
+    /// opened. A file written over breaks it, as does one that is gone; one that starts
+    /// with `~` breaks anyway, after its first frame was shown.
+    struct Rereads {
+        path: std::path::PathBuf,
+        opened: Vec<u8>,
+        first: Option<Frame>,
+        polls: u32,
+    }
+    impl Source for Rereads {
+        fn kind(&self) -> Kind {
+            Kind::Video
+        }
+        fn poll(&mut self, _: Instant) -> Result<Option<Frame>, MediaError> {
+            self.polls += 1;
+            if let Some(f) = self.first.take() {
+                return Ok(Some(f));
+            }
+            let read = std::fs::read(&self.path).ok();
+            // the loader's poll, the one that takes it on screen, the next frame's
+            let reason = if self.opened.first() == Some(&b'~') && self.polls > 3 {
+                "broke"
+            } else if read.as_ref() != Some(&self.opened) {
+                "MKV: None"
+            } else {
+                return Ok(None);
+            };
+            Err(MediaError::Video {
+                path: self.path.display().to_string(),
+                reason: reason.into(),
+            })
+        }
+    }
+
     static TARGETS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
     static REFUSED: AtomicBool = AtomicBool::new(false);
 
@@ -805,9 +890,24 @@ mod tests {
                 }))
             }
             // files in a `scratch` directory, opened as media::open would: a file that isn't
-            // there is missing, one that starts with `!` is broken, a clip is sticky
+            // there is missing, one that starts with `!` is broken, a clip (.mp4) is sticky,
+            // a .webm is read as it plays (see `Rereads`)
             _ if p.path.starts_with(std::env::temp_dir()) => match std::fs::read(&p.path) {
                 Err(_) => Err(MediaError::Missing(path.into())),
+                // half of it, and the copy goes on while it is opened
+                Ok(b) if b.first() == Some(&b'!') && path.ends_with(".copying") => {
+                    std::fs::write(&p.path, b"whole picture").unwrap();
+                    Err(MediaError::Open {
+                        path: path.into(),
+                        reason: "broken".into(),
+                    })
+                }
+                Ok(b) if path.ends_with(".webm") => Ok(Box::new(Rereads {
+                    path: p.path.clone(),
+                    first: Some(pixel(1, b[0])),
+                    opened: b,
+                    polls: 0,
+                })),
                 Ok(b) if b.first() == Some(&b'!') => Err(MediaError::Open {
                     path: path.into(),
                     reason: "broken".into(),
@@ -1088,23 +1188,270 @@ mod tests {
         }
         assert_eq!(opens(path), 1);
 
-        // it appears: the next look opens it, and the repaint comes once it is open
+        // it appears: opened at the next look that finds it the same, and the repaint
+        // comes once it is open
         std::fs::write(&file, b"here").unwrap();
         r.next_frame_in(id, t + LOOK_EVERY * 4);
+        assert_eq!(opens(path), 1, "it may still be being copied");
+        r.next_frame_in(id, t + LOOK_EVERY * 5);
         assert!(loaded(&r, &p));
         assert_eq!(opens(path), 2);
         assert_eq!(
-            r.next_frame_in(id, t + LOOK_EVERY * 4),
+            r.next_frame_in(id, t + LOOK_EVERY * 5),
             Some(Duration::ZERO)
         );
         r.begin_frame();
         assert_eq!(
-            shown.show(r.resolve(&p, (0, 0), t + LOOK_EVERY * 4)),
+            shown.show(r.resolve(&p, (0, 0), t + LOOK_EVERY * 5)),
             Some(b'h')
         );
         assert!(r.notifier().pop().is_some(), "missing, reported once");
         assert!(r.notifier().pop().is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_that_appears_is_opened_once_it_stops_changing() {
+        let dir = scratch("copied-in");
+        let file = dir.join("cover.png");
+        let path = file.to_str().unwrap();
+        let p = play(path);
+
+        let mut r = reg();
+        assert!(settle(&mut r, &p).is_none());
+        assert!(r.notifier().pop().is_some(), "missing, reported");
+        let id = r.id_of(&p).unwrap();
+        let t = Instant::now();
+
+        // being copied in: half of it at one look, all of it at the next
+        std::fs::write(&file, b"!half").unwrap();
+        r.next_frame_in(id, t + LOOK_EVERY);
+        std::fs::write(&file, b"whole picture").unwrap();
+        r.next_frame_in(id, t + LOOK_EVERY * 2);
+        assert_eq!(opens(path), 1, "not opened while it changes");
+        // the same at the next look: opened, and it opens fine
+        r.next_frame_in(id, t + LOOK_EVERY * 3);
+        assert!(loaded(&r, &p));
+        assert_eq!(opens(path), 2);
+        r.begin_frame();
+        let mut shown = Textures::default();
+        assert_eq!(
+            shown.show(r.resolve(&p, (0, 0), t + LOOK_EVERY * 3)),
+            Some(b'w')
+        );
+        assert!(r.notifier().pop().is_none(), "no error for the half file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_picture_replaced_twice_shows_up_on_a_monitor_left_behind() {
+        let dir = scratch("twice");
+        let file = dir.join("cover.png");
+        std::fs::write(&file, b"red").unwrap();
+        let p = play(file.to_str().unwrap());
+        let (mut a, mut b) = (Textures::default(), Textures::default());
+
+        let mut r = reg();
+        settle(&mut r, &p).expect("cover loaded");
+        let t = Instant::now();
+        for shown in [&mut a, &mut b] {
+            r.begin_frame();
+            assert_eq!(shown.show(r.resolve(&p, (0, 0), t)), Some(b'r'));
+        }
+        let first = r.id_of(&p).unwrap(); // both monitors' boxes have it
+        // another cover, whose id comes between this one's
+        let other = play("/other");
+        settle(&mut r, &other).expect("other cover loaded");
+        let other_id = r.id_of(&other).unwrap();
+
+        // replaced twice; monitor A has capture frames and takes each new picture, B none
+        let mut at = t;
+        for (content, pixel) in [(&b"green"[..], b'g'), (b"blue", b'b')] {
+            let asked = r.id_of(&p).unwrap();
+            std::fs::write(&file, content).unwrap();
+            at += LOOK_EVERY;
+            r.next_frame_in(asked, at);
+            at += LOOK_EVERY;
+            r.next_frame_in(asked, at);
+            assert!(loaded(&r, &p));
+            r.begin_frame();
+            assert_eq!(a.show(r.resolve(&p, (0, 0), at)), Some(pixel));
+        }
+        let last = r.id_of(&p).unwrap();
+        assert!(
+            first < other_id && other_id < last,
+            "{first} {other_id} {last}"
+        );
+
+        // B's box, still asked about by the first id, shows the first picture: repaint it
+        assert_eq!(r.next_frame_in(first, at), Some(Duration::ZERO));
+        r.begin_frame();
+        assert_eq!(b.show(r.resolve(&p, (0, 0), at)), Some(b'b'));
+        // the other cover's id is still its own: nothing to repaint for it
+        assert!(
+            r.next_frame_in(other_id, at)
+                .is_some_and(|d| d > Duration::ZERO)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_default_file_still_being_copied_in_is_opened_once_it_stops_changing() {
+        let dir = scratch("default-copied-in");
+        let file = dir.join("noshare-cover.copying");
+        std::fs::write(&file, b"!half").unwrap();
+        let path = file.to_str().unwrap();
+
+        // the default file is found the moment it is there, and opened at once (prewarm)
+        let mut r = Registry::with_opener(opener);
+        r.set_settings(
+            Settings {
+                path_cover: file.clone(),
+                ..Settings::default()
+            },
+            None,
+        );
+        let p = r.default_play();
+        assert!(settle(&mut r, &p).is_none(), "the half file didn't open");
+        assert!(
+            r.notifier().pop().is_none(),
+            "the file changed while it was opened: not reported"
+        );
+
+        // looked at like a replaced file: opened once it is the same at two looks
+        let id = r.id_of(&p).unwrap();
+        let t = Instant::now();
+        r.next_frame_in(id, t);
+        assert_eq!(opens(path), 1, "not while it may change");
+        r.next_frame_in(id, t + LOOK_EVERY);
+        assert!(loaded(&r, &p));
+        assert_eq!(opens(path), 2);
+        r.begin_frame();
+        let mut shown = Textures::default();
+        assert_eq!(
+            shown.show(r.resolve(&p, (0, 0), t + LOOK_EVERY)),
+            Some(b'w')
+        );
+        assert!(r.notifier().pop().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_video_broken_by_its_file_written_over_waits_for_the_new_file() {
+        let dir = scratch("written-over");
+        let file = dir.join("clip.webm");
+        std::fs::write(&file, b"red").unwrap();
+        let path = file.to_str().unwrap();
+        let p = play(path);
+        let mut shown = Textures::default();
+
+        let mut r = reg();
+        settle(&mut r, &p).expect("clip loaded");
+        let t = Instant::now();
+        let mut frame = |r: &mut Registry, at: Instant| {
+            r.begin_frame();
+            shown.show(r.resolve(&p, (0, 0), at))
+        };
+        assert_eq!(frame(&mut r, t), Some(b'r'));
+
+        // an encoder writes straight to the file: the clip breaks while it plays
+        std::fs::write(&file, b"green, half written").unwrap();
+        assert_eq!(frame(&mut r, t), Some(b'r'), "the picture stays");
+        assert!(r.notifier().pop().is_none(), "not reported");
+        assert!(matches!(r.covers[&p].state, State::Failed));
+        // still being written at the next look, done at the one after: opened at the third
+        frame(&mut r, t);
+        std::fs::write(&file, b"green").unwrap();
+        assert_eq!(frame(&mut r, t + LOOK_EVERY), Some(b'r'));
+        assert_eq!(opens(path), 1, "not while it changes");
+        frame(&mut r, t + LOOK_EVERY * 2);
+        assert!(loaded(&r, &p));
+        assert_eq!(opens(path), 2);
+        assert_eq!(frame(&mut r, t + LOOK_EVERY * 2), Some(b'g'));
+        assert_eq!(
+            frame(&mut r, t + LOOK_EVERY * 2),
+            Some(b'g'),
+            "and it plays"
+        );
+        assert!(r.notifier().pop().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_put_back_as_it_was_after_breaking_a_video_is_opened_again() {
+        let dir = scratch("put-back");
+        let file = dir.join("clip.webm");
+        std::fs::write(&file, b"red").unwrap();
+        let path = file.to_str().unwrap();
+        let p = play(path);
+        let mut shown = Textures::default();
+
+        let mut r = reg();
+        settle(&mut r, &p).expect("clip loaded");
+        let id = r.id_of(&p).unwrap();
+        let t = Instant::now();
+        let mut frame = |r: &mut Registry, at: Instant| {
+            r.begin_frame();
+            shown.show(r.resolve(&p, (0, 0), at))
+        };
+        assert_eq!(frame(&mut r, t), Some(b'r'));
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        // written over, which breaks the clip, then put back as it was (`cp -p` of a copy)
+        std::fs::write(&file, b"another clip").unwrap();
+        assert_eq!(frame(&mut r, t), Some(b'r'));
+        std::fs::write(&file, b"red").unwrap();
+        let f = std::fs::File::options().write(true).open(&file).unwrap();
+        f.set_modified(modified).unwrap();
+        drop(f);
+        frame(&mut r, t);
+        frame(&mut r, t + LOOK_EVERY);
+        assert!(loaded(&r, &p));
+        assert_eq!(opens(path), 2, "opened again");
+        assert_eq!(frame(&mut r, t + LOOK_EVERY), Some(b'r'));
+        assert_ne!(r.id_of(&p), Some(id), "a new source");
+        assert!(r.notifier().pop().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_video_that_breaks_on_an_unchanged_or_gone_file_is_reported() {
+        let dir = scratch("breaks");
+        for (name, content) in [("broken.webm", &b"~clip"[..]), ("gone.webm", b"clip")] {
+            let file = dir.join(name);
+            std::fs::write(&file, content).unwrap();
+            let path = file.to_str().unwrap();
+            let p = play(path);
+            let mut shown = Textures::default();
+
+            let mut r = reg();
+            settle(&mut r, &p).expect("clip loaded");
+            let t = Instant::now();
+            r.begin_frame();
+            assert_eq!(shown.show(r.resolve(&p, (0, 0), t)), Some(content[0]));
+            if name == "gone.webm" {
+                std::fs::remove_file(&file).unwrap();
+            }
+            // it breaks after its first frame was shown: reported once, the black box
+            for i in 0..3 {
+                r.begin_frame();
+                assert_eq!(
+                    shown.show(r.resolve(&p, (0, 0), t + LOOK_EVERY * i)),
+                    None,
+                    "{name}"
+                );
+            }
+            let note = r.notifier().pop().expect(name);
+            assert!(note.contains(path), "{name}: {note}");
+            assert!(r.notifier().pop().is_none(), "{name}: once");
+            assert_eq!(opens(path), 1, "{name}: not opened again");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

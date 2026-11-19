@@ -221,6 +221,12 @@ pub struct MkvDemux {
     frame: matroska_demuxer::Frame,
     /// nothing read yet since the start of the file
     first: bool,
+    /// the video track's DefaultDuration, in nanoseconds
+    default_ns: Option<u64>,
+    /// see `Demuxer::frames_end`
+    frames_end: Option<Duration>,
+    /// the file has tracks besides the video
+    others: bool,
 }
 
 impl MkvDemux {
@@ -252,6 +258,7 @@ impl MkvDemux {
             .filter(|d| *d > 0.0)
             .and_then(|d| Duration::try_from_secs_f64(d * scale_ns as f64 / 1e9).ok());
         let track = entry.track_number().get();
+        let default_ns = entry.default_duration().map(|d| d.get());
 
         Ok(Self {
             info: VideoInfo {
@@ -266,6 +273,9 @@ impl MkvDemux {
             scale_ns,
             frame: Default::default(),
             first: true,
+            default_ns,
+            frames_end: None,
+            others: mkv.tracks().len() > 1,
             mkv,
             file,
         })
@@ -379,6 +389,14 @@ impl Demuxer for MkvDemux {
                 continue;
             }
             let pts = Duration::from_nanos(self.frame.timestamp.saturating_mul(self.scale_ns));
+            // a BlockDuration is in the file's time units, a DefaultDuration in nanoseconds
+            let own = self
+                .frame
+                .duration
+                .map(|d| d.saturating_mul(self.scale_ns))
+                .or(self.default_ns)
+                .map(|ns| pts.saturating_add(Duration::from_nanos(ns)));
+            self.frames_end = self.frames_end.max(own);
             // is_keyframe is only known for SimpleBlock; otherwise treat the first frame as a keyframe
             let key = self.frame.is_keyframe.unwrap_or(self.first);
             self.first = false;
@@ -393,8 +411,19 @@ impl Demuxer for MkvDemux {
         }
     }
 
+    fn frames_end(&self) -> Option<Duration> {
+        self.frames_end
+    }
+
+    /// The Segment's duration is the file's: with other tracks it may be where the
+    /// longest one ends.
+    fn duration_may_be_another_tracks(&self) -> bool {
+        self.others
+    }
+
     fn rewind(&mut self) -> PipeResult<()> {
         self.first = true;
+        self.frames_end = None;
         // Not a seek: without Cues it goes by the clusters' timestamps and finds nothing when
         // the one cluster starts before the time asked for (the video starts after another
         // track's blocks) or after it (a file cut with its timestamps kept starts minutes in,
@@ -625,6 +654,35 @@ mod tests {
                 .collect();
             assert_eq!(got, [0, 40, 80, 120, 160, 200].map(ms), "{name}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audio that runs on for two seconds after three frames of video, in a file that
+    /// doesn't give its frames durations (SimpleBlocks, no DefaultDuration): the file's
+    /// duration is the audio's, and a loop goes on where the frames end, not there.
+    #[test]
+    fn a_webm_without_frame_durations_loops_where_its_video_ends() {
+        let dir = std::env::temp_dir().join(format!("nsc-demux-tracks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long audio.webm");
+        let (v, a) = (1, 2);
+        let mut blocks = vec![(v, 0), (v, 40), (v, 80)];
+        blocks.extend((0..=100).map(|i| (a, i * 20)));
+        write_webm(&path, 0, &blocks, 2020);
+
+        let ms = Duration::from_millis;
+        let d = open(&path).unwrap();
+        assert_eq!(d.info().duration, Some(ms(2020)));
+        assert!(d.duration_may_be_another_tracks());
+        use crate::media::video::pipeline::{Next, Pipeline, testing::FakeDecoder};
+        let mut p = Pipeline::new(d, Box::new(FakeDecoder::default()), true);
+        let got: Vec<_> = (0..6)
+            .map(|_| match p.next_frame() {
+                Ok(Next::Frame(f)) => f.pts,
+                other => panic!("it loops, got {:?}", other.err()),
+            })
+            .collect();
+        assert_eq!(got, [0, 40, 80, 120, 160, 200].map(ms));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1740,5 +1798,151 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// WebMs as ffmpeg writes them (CPU encoders; skipped without them): a second of video
+    /// with three of audio, a GIF whose last frame stays up for two seconds, and a single
+    /// picture with three seconds of audio. The file's duration is the longer track's;
+    /// where the video ends comes from its frames' own durations, and a loop goes on from
+    /// there (a single picture's once per file).
+    ///
+    /// What ffmpeg writes depends on its version (its GIF reader, its encoders, its
+    /// muxer): ffprobe, another reader of the same file, tells whether a file is the one
+    /// a case is about, and one that isn't is skipped rather than failed.
+    #[test]
+    fn where_the_video_of_a_webm_ends() {
+        let dir = std::env::temp_dir().join(format!("nsc-demux-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ffmpeg = |args: &[&str], out: &Path| {
+            std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+                .args(args)
+                .arg(out)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let ms = Duration::from_millis;
+        // the video's packets as ffprobe reads them, and where they end by their durations
+        // if every one has one
+        let probe = |path: &Path| -> Option<(u32, Option<Duration>)> {
+            let out = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0"])
+                .args([
+                    "-show_entries",
+                    "packet=pts_time,duration_time",
+                    "-of",
+                    "csv=p=0",
+                ])
+                .arg(path)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            let time = |s: &str| {
+                let secs = s.trim().parse::<f64>().ok().filter(|s| *s >= 0.0)?;
+                Some(ms((secs * 1000.0).round() as u64))
+            };
+            let mut packets = 0;
+            let mut end = Some(Duration::ZERO);
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let Some((pts, duration)) = line.split_once(',') else {
+                    continue;
+                };
+                packets += 1;
+                end = end
+                    .zip(time(pts).zip(time(duration)))
+                    .map(|(e, (p, d))| e.max(p + d));
+            }
+            Some((packets, end))
+        };
+        let gif = dir.join("pause.gif");
+        {
+            let mut f = File::create(&gif).unwrap();
+            let palette = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+            let mut enc = gif::Encoder::new(&mut f, 16, 16, &palette).unwrap();
+            for (i, delay) in [10u16, 10, 200].into_iter().enumerate() {
+                let frame = gif::Frame {
+                    width: 16,
+                    height: 16,
+                    delay,
+                    buffer: std::borrow::Cow::Owned(vec![i as u8; 256]),
+                    ..gif::Frame::default()
+                };
+                enc.write_frame(&frame).unwrap();
+            }
+        }
+        let (av, pause, still) = (
+            dir.join("av.webm"),
+            dir.join("pause.webm"),
+            dir.join("still.webm"),
+        );
+        let vp9 = ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "50k"];
+        let opus = ["-c:a", "libopus"];
+        let audio = "sine=duration=3";
+        let with_audio = |video: &str, out: &Path| {
+            let inputs = ["-f", "lavfi", "-i", video, "-f", "lavfi", "-i", audio];
+            ffmpeg(&[inputs.as_slice(), &vp9, &opus].concat(), out)
+        };
+        let made = with_audio("testsrc=size=64x64:rate=10:duration=1", &av)
+            && ffmpeg(
+                &[["-i", gif.to_str().unwrap()].as_slice(), &vp9].concat(),
+                &pause,
+            )
+            && with_audio("color=red:size=64x64:rate=25:duration=0.04", &still);
+        if !made {
+            eprintln!("no ffmpeg with libvpx-vp9 and libopus, skipping");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        // (the file, its video's frames, where they end, and whether that end is where a
+        // frame rate would put it: a reader may make a duration up from the frame rate
+        // where the file has none, the GIF's pause it can't)
+        let cases = [
+            (&av, 10, ms(1000), true),
+            (&pause, 3, ms(2200), false),
+            (&still, 1, ms(40), true),
+        ];
+        for (path, frames, end, by_rate) in cases {
+            let name = path.file_name().unwrap().to_string_lossy();
+            match probe(path) {
+                Some(seen) if seen == (frames, Some(end)) => {}
+                seen => {
+                    eprintln!(
+                        "{name}: ffprobe reads {seen:?}, not {frames} frames that end at \
+                         {end:?}: skipping it"
+                    );
+                    continue;
+                }
+            }
+            let mut d = open(path).unwrap();
+            assert_eq!(d.frames_end(), None, "{name}: nothing read yet");
+            let mut n = 0;
+            while d.next_packet().unwrap().is_some() {
+                n += 1;
+            }
+            assert_eq!(n, frames, "{name}");
+            if by_rate && d.frames_end().is_none() {
+                eprintln!("{name}: the frames have no durations in the file, skipping it");
+                continue;
+            }
+            assert_eq!(d.frames_end(), Some(end), "{name}");
+            let file = d.info().duration.expect("duration");
+            if path != &pause {
+                assert!(file > ms(2900), "{name}: the file's duration is {file:?}");
+            }
+
+            use crate::media::video::pipeline::{Next, Pipeline, testing::FakeDecoder};
+            d.rewind().unwrap();
+            assert_eq!(d.frames_end(), None, "{name}: read again from the start");
+            let mut p = Pipeline::new(d, Box::new(FakeDecoder::default()), true);
+            let next_pass = (0..=frames)
+                .map(|_| match p.next_frame() {
+                    Ok(Next::Frame(f)) => f.pts,
+                    other => panic!("{name}: it loops, got {:?}", other.err()),
+                })
+                .last();
+            let want = if frames == 1 { file } else { end };
+            assert_eq!(next_pass, Some(want), "{name}: the next pass starts there");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

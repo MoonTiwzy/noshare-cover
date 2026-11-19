@@ -68,10 +68,10 @@ only: without libva there is no VA-API, but the plugin still loads and uses the 
    cover's frame rate, and not at all for a still. Hyprland only produces capture frames when
    the monitor repaints, so a video cover would otherwise stall on a static monitor. The
    question also keeps a video decoding between two frames, and has the core look at the
-   file of a shown cover once a second: a file replaced on disk (once it stops changing), a
-   missing one that appeared or a broken one that was fixed is opened again, and the box is
-   damaged when the new picture is there. A new source gets a new cover id, so the layer
-   never shows the old texture for it.
+   file of a shown cover once a second: a file replaced on disk or a missing one that
+   appeared (once it stops changing), or a broken one that was fixed, is opened again, and
+   the box is damaged when the new picture is there. A new source gets a new cover id, so
+   the layer never shows the old texture for it.
 8. A capture into a client's dmabuf has no texture to read back, which blur under a
    translucent window over a cover needs: such a frame is drawn into a framebuffer of ours and
    copied over. Only such a frame: one without a hidden window and a translucent one on the
@@ -80,12 +80,26 @@ only: without libva there is no VA-API, but the plugin still loads and uses the 
 ## Video
 
 One thread per source. Only the latest decoded frame is exposed (no queue, no memory
-growth). The thread sleeps when nobody asks for frames for 400 ms; after waking up the
-clock restarts from the current frame instead of catching up. Frames more than 80 ms late
-are dropped. The first poll of a new source waits up to 120 ms for its first frame.
-Dropping a source = `quit` + `notify` + `join`: unloading the plugin leaves no threads. The
-registry drops it on a thread of its own, never on the render thread (step 6 above).
-A decoder panic is caught in the thread and reported as an error.
+growth). The thread sleeps when nobody asks for frames for 400 ms, also while it waits
+for a frame that is a long way off (such a frame in video memory is let go of, so the
+decoder gets its buffer back, unless the video doesn't loop and it may be the last one);
+after waking up the clock restarts from the current frame instead of catching up. A
+source opened ahead of its first capture stops at its first frame until the cover is
+shown, so the video starts from its beginning there. Frames more than 80 ms late are
+dropped. The first poll of a new source waits up to 120 ms for its first frame. Dropping a
+source = `quit` + `notify` + `join`: unloading the plugin leaves no threads. The registry
+drops it on a thread of its own, never on the render thread (step 6 above).
+A decoder panic is caught in the thread. It and any other decoder error, also one after
+frames were shown, are reported, and the cover is the black box until its file changes.
+Not when the file changed since it was opened (written over in place, or still being
+copied in when it was opened, which goes for any cover): the picture stays if it is in
+pixels, and the file is opened again once it stops changing.
+A loop starts over where the video's frames end: by the durations the container gives
+them, if it does (a Matroska file's duration can be its longer audio's), and never at a
+duration the file no longer reaches (a file cut short) or that may be another track's
+(where the frames alone say where they end). A Matroska video of a single frame with a
+longer track (a picture with a song under it) is read again only once per the file's
+duration, as nothing changes on screen in between.
 
 Backend (`backend` in the config): `auto` tries the GPU (NVDEC on NVIDIA render nodes, then
 VA-API) and falls back to the CPU; `gpu` never falls back; `cpu` is software only.

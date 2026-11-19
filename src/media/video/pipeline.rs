@@ -44,6 +44,19 @@ pub trait Demuxer: Send {
     fn next_packet(&mut self) -> PipeResult<Option<Packet>>;
     /// Rewind to the start (for looping).
     fn rewind(&mut self) -> PipeResult<()>;
+    /// Where the video's frames read since the last rewind end by the durations the
+    /// container gives them, the last one's included; `None` if it gives none. Unlike
+    /// `VideoInfo::duration`, which can be the whole file's (a Matroska file's audio may
+    /// run on after the video), this is the video track's alone.
+    fn frames_end(&self) -> Option<Duration> {
+        None
+    }
+    /// `VideoInfo::duration` may be where another track ends: the container gives the
+    /// whole file's, and the file has more than the video (a Matroska file's audio may run
+    /// on after the video).
+    fn duration_may_be_another_tracks(&self) -> bool {
+        false
+    }
 }
 
 pub trait Decoder: Send {
@@ -72,13 +85,17 @@ pub struct Pipeline {
     looped: bool,
     /// pts offset added after each loop pass so time stays monotonic.
     loop_offset: Duration,
-    /// This pass: packets read, the first and the last frame's pts, the gap between the
-    /// last two frames, and where the pass ends by its frames (the last pts plus that gap).
+    /// This pass: packets read, frames out, the first and the last frame's pts, the gap
+    /// between the last two frames, and where the pass ends by its frames (the last pts
+    /// plus that gap).
     packets: u32,
+    frames: u32,
     first_pts: Option<Duration>,
     last_pts: Option<Duration>,
     gap: Duration,
     seen_end: Duration,
+    /// This pass ended where the file couldn't be read any further, for this reason.
+    cut: Option<String>,
     /// A decoder to go on with if this one turns out not to take the stream (see
     /// `with_spare`), until the first frame.
     spare: Option<Spare>,
@@ -110,10 +127,12 @@ impl Pipeline {
             looped,
             loop_offset: Duration::ZERO,
             packets: 0,
+            frames: 0,
             first_pts: None,
             last_pts: None,
             gap: Duration::ZERO,
             seen_end: Duration::ZERO,
+            cut: None,
             spare: None,
             produced: false,
             target: (0, 0),
@@ -147,12 +166,18 @@ impl Pipeline {
 
     /// The file is read from its start again.
     fn new_pass(&mut self) {
-        (self.packets, self.first_pts, self.last_pts) = (0, None, None);
+        (self.packets, self.frames) = (0, 0);
+        (self.first_pts, self.last_pts) = (None, None);
         self.seen_end = Duration::ZERO;
+        self.cut = None;
     }
 
     pub fn info(&self) -> &VideoInfo {
         self.demux.info()
+    }
+
+    pub fn looped(&self) -> bool {
+        self.looped
     }
 
     pub fn decoder_name(&self) -> &'static str {
@@ -188,6 +213,7 @@ impl Pipeline {
         for _ in 0..4096 {
             if let Some(mut f) = self.ready.pop_front() {
                 self.produced = true;
+                self.frames = self.frames.saturating_add(1);
                 if let Some(gap) = self.last_pts.and_then(|p| f.pts.checked_sub(p))
                     && !gap.is_zero()
                 {
@@ -195,11 +221,19 @@ impl Pipeline {
                 }
                 self.first_pts = Some(self.first_pts.map_or(f.pts, |p| p.min(f.pts)));
                 self.last_pts = Some(f.pts);
-                self.seen_end = self.seen_end.max(f.pts + self.gap);
-                f.pts += self.loop_offset;
+                // timestamps come from the file: adding them up must not panic on any
+                self.seen_end = self.seen_end.max(f.pts.saturating_add(self.gap));
+                f.pts = f.pts.saturating_add(self.loop_offset);
                 return Ok(Next::Frame(f));
             }
             if self.flushed {
+                // Not a single frame out of what could be read: what stopped the reading is
+                // the error, the next pass would only stop at the same place.
+                if self.first_pts.is_none()
+                    && let Some(reason) = self.cut.take()
+                {
+                    return Err(reason);
+                }
                 if !self.looped {
                     return Ok(Next::End);
                 }
@@ -208,12 +242,32 @@ impl Pipeline {
                 // frame of this one, or its frames are all in the past and get dropped.
                 // Both are where the pass ends, not how long it is: a file cut with its
                 // timestamps kept starts minutes in, and ffmpeg writes a Matroska file's
-                // duration as its last timestamp (600 s..610 s says 610 s).
-                let end = self.demux.info().duration.unwrap_or(Duration::ZERO);
+                // duration as its last timestamp (600 s..610 s says 610 s). It may also
+                // reach past the video: the end of a Matroska file's longer audio, of a file
+                // cut short. The video would stand still there on every pass, so where the
+                // video's frames end by their own durations wins, if the container has them
+                // (they also keep a last frame meant to stay up longer, a GIF's final pause).
+                // Without them the frames alone tell where the pass ends when the duration
+                // may be another track's or the file was cut short.
+                // A pass of a single frame is a still: the next one shows the same picture,
+                // so how long it is shows nowhere, only what it costs (the whole file read
+                // again, the frame decoded and handed out again). It lasts as long as the
+                // file says then, whatever track that is of, the way a picture with a song
+                // under it plays once per song.
+                let file = self.demux.info().duration;
+                let frames_end = self.demux.frames_end();
+                let end = if self.frames == 1 {
+                    frames_end.max(file)
+                } else {
+                    frames_end.or(file.filter(|_| {
+                        self.cut.is_none() && !self.demux.duration_may_be_another_tracks()
+                    }))
+                }
+                .unwrap_or(Duration::ZERO);
                 let length = end
                     .max(self.seen_end)
                     .saturating_sub(self.first_pts.unwrap_or_default());
-                self.loop_offset += length.max(SHORTEST_PASS);
+                self.loop_offset = self.loop_offset.saturating_add(length.max(SHORTEST_PASS));
                 self.new_pass();
                 self.demux.rewind()?;
                 self.decoder.reset();
@@ -223,7 +277,10 @@ impl Pipeline {
             let packet = match self.demux.next_packet() {
                 // a file cut short (a recording that crashed) ends where it can't be read
                 // any further, as long as it had something before that
-                Err(_) if self.packets > 0 => None,
+                Err(e) if self.packets > 0 => {
+                    self.cut = Some(e);
+                    None
+                }
                 other => other?,
             };
             match packet {
@@ -291,6 +348,56 @@ pub(crate) mod testing {
         fn rewind(&mut self) -> PipeResult<()> {
             self.pos = 0;
             Ok(())
+        }
+    }
+
+    /// The video of a file that may have more tracks: `frames` spaced by `step`, the
+    /// container's `duration` (the file's), where the frames `end` by their own durations
+    /// if the container gives them, and whether there are `others`.
+    pub struct Tracks {
+        inner: FakeDemux,
+        info: VideoInfo,
+        end: Option<Duration>,
+        others: bool,
+    }
+
+    impl Tracks {
+        pub fn new(
+            frames: u32,
+            step: Duration,
+            duration: Duration,
+            end: Option<Duration>,
+            others: bool,
+        ) -> Self {
+            let inner = FakeDemux::new(frames, step);
+            let info = VideoInfo {
+                duration: Some(duration),
+                ..inner.info.clone()
+            };
+            Self {
+                inner,
+                info,
+                end,
+                others,
+            }
+        }
+    }
+
+    impl Demuxer for Tracks {
+        fn info(&self) -> &VideoInfo {
+            &self.info
+        }
+        fn next_packet(&mut self) -> PipeResult<Option<Packet>> {
+            self.inner.next_packet()
+        }
+        fn rewind(&mut self) -> PipeResult<()> {
+            self.inner.rewind()
+        }
+        fn frames_end(&self) -> Option<Duration> {
+            self.end
+        }
+        fn duration_may_be_another_tracks(&self) -> bool {
+            self.others
         }
     }
 
@@ -466,15 +573,22 @@ mod tests {
     #[test]
     fn a_file_cut_short_ends_where_it_stops() {
         let ms = Duration::from_millis;
-        let mut p = Pipeline::new(
-            Box::new(Cut::new(10, 2)),
-            Box::new(FakeDecoder::default()),
-            true,
-        );
-        let got: Vec<_> = (0..4)
-            .map(|_| pts(p.next_frame().unwrap()).unwrap())
-            .collect();
-        assert_eq!(got, [0, 40, 80, 120].map(ms), "two frames, then again");
+        // the container doesn't say how long it is, or says how long it was before the cut
+        // (its header is whole, 400 ms of frames): either way the loop goes on right after
+        // the frames that are left, not after a pause where the rest used to be
+        for duration in [None, Some(ms(400))] {
+            let mut cut = Cut::new(10, 2);
+            cut.info.duration = duration;
+            let mut p = Pipeline::new(Box::new(cut), Box::new(FakeDecoder::default()), true);
+            let got: Vec<_> = (0..4)
+                .map(|_| pts(p.next_frame().unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                got,
+                [0, 40, 80, 120].map(ms),
+                "two frames, then again ({duration:?})"
+            );
+        }
 
         // nothing readable at all is still an error
         let mut p = Pipeline::new(
@@ -483,6 +597,91 @@ mod tests {
             true,
         );
         assert!(p.next_frame().is_err());
+    }
+
+    /// Takes packets and never has a picture.
+    struct Swallows;
+    impl Decoder for Swallows {
+        fn name(&self) -> &'static str {
+            "swallows"
+        }
+        fn decode(&mut self, _: &Packet) -> PipeResult<Vec<DecodedFrame>> {
+            Ok(Vec::new())
+        }
+        fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
+            Ok(Vec::new())
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn a_file_cut_short_before_its_first_frame_says_so() {
+        // what could be read gave no picture: the error is the file's, not a decoder
+        // that "produces no frames" after reading the file over and over
+        for looped in [true, false] {
+            let mut p = Pipeline::new(Box::new(Cut::new(10, 1)), Box::new(Swallows), looped);
+            assert_eq!(
+                p.next_frame().err().as_deref(),
+                Some("read past the end"),
+                "looped: {looped}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loop_goes_on_where_the_video_ends() {
+        let ms = Duration::from_millis;
+        // (frames 100 ms apart, the container's duration, where the video's frames end by
+        // their own durations, other tracks, where the next pass starts)
+        let files = [
+            // ten frames, and audio that runs on for two more seconds: no pause for it
+            (10, ms(3008), Some(ms(1000)), true, ms(1000)),
+            // and so without the frames' durations: the frames alone say where they end
+            (10, ms(3008), None, true, ms(1000)),
+            // three frames, the last one staying up for two seconds (a GIF's final pause,
+            // as ffmpeg writes it into a WebM): kept
+            (3, ms(2200), Some(ms(2200)), false, ms(2200)),
+            // and so without the frames' durations: the duration is the video's alone
+            (3, ms(2200), None, false, ms(2200)),
+            // a single picture with a minute of a song under it: the same picture again
+            // every frame would only cost, it comes again once per song
+            (1, ms(60008), Some(ms(40)), true, ms(60008)),
+            (1, ms(60008), None, true, ms(60008)),
+            (1, ms(60008), Some(ms(40)), false, ms(60008)),
+            // or its own duration is longer than the file says
+            (1, ms(30), Some(ms(40)), true, ms(40)),
+        ];
+        for (frames, duration, end, others, next) in files {
+            let mut p = Pipeline::new(
+                Box::new(Tracks::new(frames, ms(100), duration, end, others)),
+                Box::new(FakeDecoder::default()),
+                true,
+            );
+            let got: Vec<_> = (0..=frames)
+                .map(|_| pts(p.next_frame().unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                got[frames as usize], next,
+                "{frames} frames, {end:?}, other tracks: {others}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamps_at_the_end_of_time_do_not_panic() {
+        let ms = Duration::from_millis;
+        let inner = FakeDemux::new(2, ms(40));
+        let info = inner.info().clone();
+        // the second frame's end is past what a Duration holds, and so is every pass after
+        let start = Duration::MAX - ms(50);
+        let mut p = Pipeline::new(
+            Box::new(Late { inner, info, start }),
+            Box::new(FakeDecoder::default()),
+            true,
+        );
+        for _ in 0..6 {
+            assert!(pts(p.next_frame().unwrap()).is_some());
+        }
     }
 
     /// A decoder that opened fine and then can't take the stream.

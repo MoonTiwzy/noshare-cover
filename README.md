@@ -269,8 +269,8 @@ windows. While the monitor is zoomed the plugin draws all the boxes itself where
 actually are: covers, or plain black for windows (and their popups) without a cover.
 
 Errors (missing file, unknown format, broken video, bad `backend`) are shown once as a
-Hyprland notification, not every frame. A missing file is picked up automatically as soon
-as it appears.
+Hyprland notification, not every frame. A missing file is picked up automatically once it
+appears and has finished being written.
 
 With hyprpm you may see `unknown config key 'plugin.no_screen_share_cover...'` at startup:
 the config is read before hyprpm loads the plugin. Hyprland reloads the config after the
