@@ -1,6 +1,10 @@
-//! GIF with correct frame compositing (disposal Keep / Background / Previous),
-//! as in the original plugin. Frames are decoded once on open, and the canvas
-//! is built step by step: going forward adds frames, going back (loop) starts over.
+//! GIF with correct frame compositing (disposal Keep / Background / Previous).
+//! Frames are decoded once on open, and the canvas is built step by step: going
+//! forward adds frames, going back (loop) starts over.
+//!
+//! The background is transparent, as in browsers (and the `image` crate): the
+//! screen's background colour index is ignored. It often names the transparent
+//! key colour, which must never be painted. Under the cover the shim draws black.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,8 +30,6 @@ struct GifFrame {
 pub struct GifSource {
     width: u32,
     height: u32,
-    /// Background color in BGRA (same as the canvas).
-    bg: [u8; 4],
     frames: Vec<GifFrame>,
     total: Duration,
     canvas: Vec<u8>,
@@ -66,13 +68,6 @@ impl GifSource {
             return Err(err(&format_args!("{width}x{height} is too large")));
         }
 
-        let bg = match (dec.bg_color(), dec.global_palette()) {
-            (Some(i), Some(pal)) if i * 3 + 2 < pal.len() => {
-                [pal[i * 3 + 2], pal[i * 3 + 1], pal[i * 3], 255]
-            }
-            _ => [0, 0, 0, 0],
-        };
-
         let mut frames = Vec::new();
         let mut held = 0u64;
         while let Some(f) = dec.read_next_frame().map_err(|e| err(&e))? {
@@ -100,7 +95,6 @@ impl GifSource {
         let mut s = Self {
             width,
             height,
-            bg,
             canvas: Vec::new(),
             frames,
             total,
@@ -117,10 +111,7 @@ impl GifSource {
     fn clear_canvas(&mut self) {
         let px = self.width as usize * self.height as usize;
         self.canvas.clear();
-        self.canvas.reserve(px * 4);
-        for _ in 0..px {
-            self.canvas.extend_from_slice(&self.bg);
-        }
+        self.canvas.resize(px * 4, 0);
         self.shown = None;
         self.backup = None;
     }
@@ -137,15 +128,14 @@ impl GifSource {
         self.frames.len() - 1
     }
 
-    fn fill_rect(&mut self, left: u32, top: u32, w: u32, h: u32, color: [u8; 4]) {
-        let x1 = (left + w).min(self.width);
+    /// Makes a rectangle of the canvas transparent.
+    fn clear_rect(&mut self, left: u32, top: u32, w: u32, h: u32) {
+        let x0 = left.min(self.width) as usize * 4;
+        let x1 = (left + w).min(self.width) as usize * 4;
         let y1 = (top + h).min(self.height);
         for y in top.min(self.height)..y1 {
             let row = (y * self.width) as usize * 4;
-            for x in left.min(self.width)..x1 {
-                let i = row + x as usize * 4;
-                self.canvas[i..i + 4].copy_from_slice(&color);
-            }
+            self.canvas[row + x0..row + x1].fill(0);
         }
     }
 
@@ -184,7 +174,7 @@ impl GifSource {
             match f.dispose {
                 DisposalMethod::Background => {
                     let (l, t, w, h) = (f.left, f.top, f.width, f.height);
-                    self.fill_rect(l, t, w, h, self.bg);
+                    self.clear_rect(l, t, w, h);
                 }
                 DisposalMethod::Previous => {
                     if let Some(b) = self.backup.take() {
@@ -352,12 +342,47 @@ mod tests {
     #[test]
     fn background_disposal_clears_rect() {
         let p = tmp("bg");
-        write_gif(&p, DisposalMethod::Background);
+        write_gif(&p, DisposalMethod::Background); // background index 0: red in the palette
         let mut g = GifSource::open(&p, 1.0, true).unwrap();
         let t0 = Instant::now();
         g.poll(t0).unwrap();
         g.poll(t0 + ms(150)).unwrap();
-        assert_eq!(g.pixel(0, 0), g.bg, "Background disposal restores bg");
+        assert_eq!(
+            g.pixel(0, 0),
+            [0, 0, 0, 0],
+            "Background disposal clears to transparent"
+        );
+        assert_eq!(g.pixel(1, 0), [255, 0, 0, 255]); // blue
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pixels_no_frame_covered_are_transparent() {
+        let p = tmp("uncovered");
+        write_gif(&p, DisposalMethod::Keep); // background index 0: red in the palette
+        let mut g = GifSource::open(&p, 1.0, true).unwrap();
+        g.poll(Instant::now()).unwrap();
+        assert_eq!(g.pixel(0, 0), [0, 0, 255, 255]); // frame 0: red
+        assert_eq!(g.pixel(1, 0), [0, 0, 0, 0], "not the background colour");
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_transparent_key_named_as_background_stays_transparent() {
+        let p = tmp("key");
+        // 2x1, palette [magenta, red], background index 0, and index 0 is also the frame's
+        // transparent colour: the left pixel is see-through, the right one red.
+        let mut bytes = b"GIF89a\x02\x00\x01\x00\x80\x00\x00".to_vec();
+        bytes.extend_from_slice(&[255, 0, 255, 255, 0, 0]); // global palette
+        bytes.extend_from_slice(&[0x21, 0xf9, 4, 0x01, 10, 0, 0, 0]); // GCE: transparent 0
+        bytes.extend_from_slice(&[0x2c, 0, 0, 0, 0, 2, 0, 1, 0, 0]); // image 2x1
+        bytes.extend_from_slice(&[2, 2, 0x44, 0x0a, 0]); // LZW: clear, 0, 1, end
+        bytes.push(0x3b);
+        std::fs::write(&p, bytes).unwrap();
+        let mut g = GifSource::open(&p, 1.0, true).unwrap();
+        g.poll(Instant::now()).unwrap();
+        assert_eq!(g.pixel(0, 0), [0, 0, 0, 0], "the key colour is not painted");
+        assert_eq!(g.pixel(1, 0), [0, 0, 255, 255]); // red in BGRA
         std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
     }
 

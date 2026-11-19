@@ -325,7 +325,7 @@ gloview releases it as soon as it sees noshare-cover, so load order doesn't matt
 | `cargo` / `rustc` (1.89+) | the Rust core | `rust` | in the flake |
 | C++ compiler (C++26), `make`, `pkg-config` | the Hyprland shim | `base-devel`, `pkgconf` | in the flake |
 | Hyprland headers | the plugin API | `hyprland` (hyprpm installs its own) | from the Hyprland package |
-| `nasm` | AV1 decoder assembly (rav1d) | `nasm` | in the flake |
+| `nasm` (x86 only) | AV1 decoder assembly (rav1d); on ARM the C compiler builds it | `nasm` | in the flake |
 | `libva`, `gbm` | the VA-API helper links against them | `libva`, `mesa` | in the flake |
 
 `make NSC_VAAPI=0` builds without VA-API; then libva and gbm are not needed. `make`
@@ -348,7 +348,7 @@ referenced from the store; the NVIDIA and VA-API drivers come from the system
 
 ### hyprpm (Arch and others)
 
-Needs `cargo`, `nasm` and `libva` to build (Arch:
+Needs `cargo`, `nasm` (on x86) and `libva` to build (Arch:
 `pacman -S rust pkgconf nasm libva`). If something is missing, `make` says what and
 which package to install. Without VA-API: `make NSC_VAAPI=0`.
 

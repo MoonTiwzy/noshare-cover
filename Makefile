@@ -7,7 +7,10 @@ CARGO    ?= cargo
 # so a rebuild after a Hyprland update reuses every compiled dependency.
 TARGET   := $(or $(CARGO_TARGET_DIR),target)
 RUST_LIB := $(TARGET)/release/libnoshare_cover.a
-RUST_SRC := Cargo.toml Cargo.lock build.rs $(shell find src -name '*.rs')
+# What cargo compiles from this repo for each artifact, vendored crates ([patch] in
+# Cargo.toml) included: re_mp4 goes into the core, cros-libva into the VA-API helper.
+# Only files cargo reads, or make would rerun a cargo build that doesn't touch the output.
+RUST_SRC := Cargo.toml Cargo.lock build.rs vendor/re_mp4/Cargo.toml $(shell find src vendor/re_mp4/src -name '*.rs')
 # VA-API helper: a separate .so with libva/libgbm, embedded into the plugin (see
 # src/media/video/decode/vaapi.rs). NSC_VAAPI=0 builds without VA-API (then libva
 # isn't needed).
@@ -23,8 +26,14 @@ endif
 ifneq ($(call have,pkg-config),y)
 MISSING += pkg-config(pacman:pkgconf)
 endif
+# rav1d (AV1 on the CPU) assembles its x86 kernels with nasm; on ARM the C compiler does
+# it, other architectures get no assembly. The architecture is the one cargo builds for.
+RUST_ARCH := $(shell $(or $(RUSTC),rustc) --print cfg 2>/dev/null | sed -n 's/^target_arch="\(.*\)"$$/\1/p')
+NEED_NASM := $(filter x86 x86_64 i386 i486 i586 i686,$(or $(RUST_ARCH),$(shell uname -m)))
+ifneq ($(NEED_NASM),)
 ifneq ($(call have,nasm),y)
 MISSING += nasm(pacman:nasm)
+endif
 endif
 ifneq ($(call havepc,hyprland),y)
 MISSING += hyprland-headers(hyprpm update / pacman:hyprland)
@@ -38,10 +47,10 @@ MISSING += gbm(pacman:mesa)
 endif
 endif
 ifneq ($(strip $(MISSING)),)
-$(error noshare-cover: missing build dependencies: $(strip $(MISSING)). Arch: sudo pacman -S --needed rust pkgconf nasm libva mesa. Without VA-API: make NSC_VAAPI=0)
+$(error noshare-cover: missing build dependencies: $(strip $(MISSING)). Arch: sudo pacman -S --needed rust pkgconf $(if $(NEED_NASM),nasm )libva mesa. Without VA-API: make NSC_VAAPI=0)
 endif
 HELPER   := $(TARGET)/release/libnoshare_cover_vaapi.so
-HELPER_SRC := vaapi-helper/Cargo.toml $(shell find vaapi-helper/src vendor -name '*.rs')
+HELPER_SRC := vaapi-helper/Cargo.toml vendor/cros-libva/Cargo.toml vendor/cros-libva/build.rs $(shell find vaapi-helper/src vendor/cros-libva/src -name '*.rs')
 
 # No ffmpeg/cairo/libjpeg/giflib: all media handling lives in the Rust core.
 PKGS     := hyprland pixman-1 libdrm wayland-server egl hyprutils hyprgraphics aquamarine hyprlang

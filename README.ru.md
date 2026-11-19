@@ -319,7 +319,7 @@ gloview отпускает её сам, как только видит noshare-c
 | `cargo` / `rustc` (1.89+) | ядро на Rust | `rust` | есть во флейке |
 | компилятор C++ (C++26), `make`, `pkg-config` | прослойка для Hyprland | `base-devel`, `pkgconf` | есть во флейке |
 | заголовки Hyprland | API плагинов | `hyprland` (hyprpm ставит свои) | из пакета Hyprland |
-| `nasm` | ассемблер для декодера AV1 (rav1d) | `nasm` | есть во флейке |
+| `nasm` (только x86) | ассемблер для декодера AV1 (rav1d); на ARM его собирает компилятор C | `nasm` | есть во флейке |
 | `libva`, `gbm` | с ними линкуется помощник VA-API | `libva`, `mesa` | есть во флейке |
 
 `make NSC_VAAPI=0` собирает без VA-API; тогда libva и gbm не нужны. `make` сначала
@@ -341,7 +341,7 @@ AV1 на процессоре, картинки и GIF ничего дополн
 
 ### hyprpm (Arch и другие)
 
-Для сборки нужны `cargo`, `nasm` и `libva` (Arch:
+Для сборки нужны `cargo`, `nasm` (на x86) и `libva` (Arch:
 `pacman -S rust pkgconf nasm libva`). Если чего-то нет, `make` сразу напишет, чего
 именно и какой пакет поставить. Без VA-API: `make NSC_VAAPI=0`.
 

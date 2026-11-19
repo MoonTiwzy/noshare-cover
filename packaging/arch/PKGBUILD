@@ -9,7 +9,9 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/MoonTiwzy/noshare-cover"
 license=('GPL-3.0-only')
 depends=('hyprland' 'gcc-libs' 'glibc')
-makedepends=('cargo' 'nasm' 'git' 'pkgconf' 'libva' 'mesa')
+makedepends=('cargo' 'git' 'pkgconf' 'libva' 'mesa')
+# rav1d (AV1 on the CPU) assembles its x86 kernels with nasm; on aarch64 the C compiler does it
+makedepends_x86_64=('nasm')
 optdepends=(
     'openh264: H.264 decoding on CPU'
     'libvpx: VP8/VP9 decoding on CPU'
