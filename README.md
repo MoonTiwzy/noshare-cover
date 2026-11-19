@@ -54,7 +54,7 @@ Everything else (per-window covers, effects, decoder choice) is in [Config](#con
 ## Status
 
 > **Status.** Works end to end on a live Hyprland 0.57 (Arch): a window with
-> `no_screen_share` shows the cover in a `grim` capture — still image, GIF, H.264, AV1, VP9 —
+> `no_screen_share` shows the cover in a `grim` capture - still image, GIF, H.264, AV1, VP9 -
 > and survives repeated `hyprctl plugin unload/load` without thread or memory growth
 > (`tests/e2e/run.sh`). Builds with Nix against Hyprland 0.57.0 (the hyprwm flake and nixpkgs)
 > and with makepkg on Arch. Hyprland 0.56 is no longer supported; on it hyprpm builds the last
@@ -282,7 +282,7 @@ plugin is loaded and the error goes away.
 ## API for other plugins
 
 Overlays that draw previews of windows (e.g. gloview) can ask noshare-cover to cover their
-boxes too — with black or with the same cover as the window. Header-only, nothing to link:
+boxes too - with black or with the same cover as the window. Header-only, nothing to link:
 [`include/noshare_cover_api.h`](include/noshare_cover_api.h).
 
 ```c
@@ -299,7 +299,7 @@ if (noshare_cover_bind(&nsc) == 0) {
         noshare_cover_drop_handle(&nsc);
 }
 
-// each overlay frame, per monitor — atomically replaces this client's rects there
+// each overlay frame, per monitor - atomically replaces this client's rects there
 noshare_cover_rect r = {x, y, w, h, rounding, window_address, NOSHARE_COVER_FILL_WINDOW};
 nsc.set_rects(client, monitor_id, &r, 1);
 

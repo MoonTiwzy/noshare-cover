@@ -190,7 +190,7 @@ mod real {
         let mut p = match open_pipeline(&path, true, &s) {
             Ok(p) => p,
             Err(e) if e.contains("not found") => {
-                eprintln!("{file}: {e} — skipping");
+                eprintln!("{file}: {e} - skipping");
                 return;
             }
             Err(e) => panic!("{file}: {e}"),
