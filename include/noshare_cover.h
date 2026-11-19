@@ -114,12 +114,14 @@ void     nsc_begin_frame(void);
 /* false: nothing to draw. out->cover_id is set even then when the cover exists and only
  * has no frame yet. */
 bool     nsc_resolve(const nsc_play_request* request, nsc_frame* out);
-/* Milliseconds until the cover has a new frame: 0 = now, -1 = its picture won't change.
- * Asking keeps a video decoding between two frames. */
+/* Milliseconds until the cover has something new to show: 0 = now, -1 = no such cover.
+ * A cover that doesn't change by itself (a still, a missing file) is due when its file is
+ * looked at next: asking is what looks at it on a still screen. Asked by the id it had
+ * before its file was opened again, it is 0 (that box shows the earlier picture). Asking
+ * also keeps a video decoding between two frames. */
 int32_t  nsc_next_frame_ms(uint64_t cover_id);
 void     nsc_prewarm(const nsc_play_request* request);
 void     nsc_end_frame(void);
-bool     nsc_animating(void);
 /* A NSC_FRAME_DMABUF frame of this cover couldn't be imported: it sends pixels from now on. */
 void     nsc_refuse_video_memory(uint64_t cover_id);
 bool     nsc_cover_alive(uint64_t cover_id);

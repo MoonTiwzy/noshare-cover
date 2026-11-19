@@ -57,13 +57,21 @@ only: without libva there is no VA-API, but the plugin still loads and uses the 
    (`nsc_refuse_video_memory`): the cover sends pixels from then on.
 5. Rectangles from other plugins (gloview's overview tiles) get black or the window's cover.
 6. `nsc_end_frame`: covers nobody showed for 30 s are closed (for video that stops the
-   thread). Every 120 frames the layer drops textures of dead covers.
+   thread); one on a captured monitor that doesn't repaint counts as shown while the pump
+   asks about it (see 7). Every 120 frames the layer drops textures of dead covers. A video
+   or GIF source is never closed on the render thread: a video joins its decode thread,
+   which can be in the middle of a frame, so it is closed on a thread of its own (joined on
+   unload).
 7. While a monitor is being shared and shows a media cover, a timer (the pump) asks the core
    when each cover on it has its next frame (`nsc_next_frame_ms`), damages the cover's box
    when the frame is there and sleeps until the next one is due: the monitor repaints at the
    cover's frame rate, and not at all for a still. Hyprland only produces capture frames when
    the monitor repaints, so a video cover would otherwise stall on a static monitor. The
-   question also keeps a video decoding between two frames.
+   question also keeps a video decoding between two frames, and has the core look at the
+   file of a shown cover once a second: a file replaced on disk (once it stops changing), a
+   missing one that appeared or a broken one that was fixed is opened again, and the box is
+   damaged when the new picture is there. A new source gets a new cover id, so the layer
+   never shows the old texture for it.
 8. A capture into a client's dmabuf has no texture to read back, which blur under a
    translucent window over a cover needs: such a frame is drawn into a framebuffer of ours and
    copied over. Only such a frame: one without a hidden window and a translucent one on the
@@ -75,7 +83,8 @@ One thread per source. Only the latest decoded frame is exposed (no queue, no me
 growth). The thread sleeps when nobody asks for frames for 400 ms; after waking up the
 clock restarts from the current frame instead of catching up. Frames more than 80 ms late
 are dropped. The first poll of a new source waits up to 120 ms for its first frame.
-Dropping a source = `quit` + `notify` + `join`: unloading the plugin leaves no threads.
+Dropping a source = `quit` + `notify` + `join`: unloading the plugin leaves no threads. The
+registry drops it on a thread of its own, never on the render thread (step 6 above).
 A decoder panic is caught in the thread and reported as an error.
 
 Backend (`backend` in the config): `auto` tries the GPU (NVDEC on NVIDIA render nodes, then
@@ -140,7 +149,7 @@ back and never has to keep a dlopen handle that would pin noshare-cover in memor
 | NVDEC (dlopen, driver parser, NV12/P016 copy) | ⚠️ builds, struct layouts checked against ffnvcodec-headers; not run on a GPU |
 | VA-API (vaapi-helper on cros-codecs, embedded, loaded from memfd) | ✅ H.264, VP9, AV1 on an AMD iGPU (radeonsi), tests with `NSC_TEST_GPU`; 8-bit only |
 | VA-API frames in video memory (VPP → RGB dma-buf → Hyprland texture) | ✅ radeonsi: `NSC_TEST_GPU` tests against the CPU's picture, `tests/e2e/video-memory.sh` in a Hyprland on that GPU; ⚠️ not run on Intel |
-| Repaint pump by frame time | ✅ `tests/e2e/pump.sh`: 10 and 30 fps covers, a still |
+| Repaint pump by frame time | ✅ `tests/e2e/pump.sh`: 10 and 30 fps covers, a still; ⚠️ a still replaced on disk: written, not run yet |
 | `shim/` (0.57.x) | ✅ builds and runs on 0.57.0 |
 | Together with gloview | ✅ `tests/e2e/with-gloview.sh`: both load orders, unload/reload, overview tiles |
 | Unload/load, leaks | ✅ `tests/e2e/run.sh`: 8 cycles, threads and RSS stable |

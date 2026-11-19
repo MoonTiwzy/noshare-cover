@@ -72,9 +72,10 @@ pub struct Pipeline {
     looped: bool,
     /// pts offset added after each loop pass so time stays monotonic.
     loop_offset: Duration,
-    /// This pass: packets read, the last frame's pts, the gap between the last two
-    /// frames, and where the pass ends by its frames (the last pts plus that gap).
+    /// This pass: packets read, the first and the last frame's pts, the gap between the
+    /// last two frames, and where the pass ends by its frames (the last pts plus that gap).
     packets: u32,
+    first_pts: Option<Duration>,
     last_pts: Option<Duration>,
     gap: Duration,
     seen_end: Duration,
@@ -109,6 +110,7 @@ impl Pipeline {
             looped,
             loop_offset: Duration::ZERO,
             packets: 0,
+            first_pts: None,
             last_pts: None,
             gap: Duration::ZERO,
             seen_end: Duration::ZERO,
@@ -139,8 +141,14 @@ impl Pipeline {
         self.demux.rewind()?;
         self.ready.clear();
         self.flushed = false;
-        (self.packets, self.last_pts, self.seen_end) = (0, None, Duration::ZERO);
+        self.new_pass();
         Ok(())
+    }
+
+    /// The file is read from its start again.
+    fn new_pass(&mut self) {
+        (self.packets, self.first_pts, self.last_pts) = (0, None, None);
+        self.seen_end = Duration::ZERO;
     }
 
     pub fn info(&self) -> &VideoInfo {
@@ -185,6 +193,7 @@ impl Pipeline {
                 {
                     self.gap = gap;
                 }
+                self.first_pts = Some(self.first_pts.map_or(f.pts, |p| p.min(f.pts)));
                 self.last_pts = Some(f.pts);
                 self.seen_end = self.seen_end.max(f.pts + self.gap);
                 f.pts += self.loop_offset;
@@ -197,9 +206,15 @@ impl Pipeline {
                 // The container's duration may be missing (a WebM written to a pipe) or
                 // shorter than the frames reach: the next pass must start after the last
                 // frame of this one, or its frames are all in the past and get dropped.
-                let length = self.demux.info().duration.unwrap_or(Duration::ZERO);
-                self.loop_offset += length.max(self.seen_end).max(SHORTEST_PASS);
-                (self.packets, self.last_pts, self.seen_end) = (0, None, Duration::ZERO);
+                // Both are where the pass ends, not how long it is: a file cut with its
+                // timestamps kept starts minutes in, and ffmpeg writes a Matroska file's
+                // duration as its last timestamp (600 s..610 s says 610 s).
+                let end = self.demux.info().duration.unwrap_or(Duration::ZERO);
+                let length = end
+                    .max(self.seen_end)
+                    .saturating_sub(self.first_pts.unwrap_or_default());
+                self.loop_offset += length.max(SHORTEST_PASS);
+                self.new_pass();
                 self.demux.rewind()?;
                 self.decoder.reset();
                 self.flushed = false;
@@ -399,6 +414,53 @@ mod tests {
             .collect();
         let want = [0, 40, 80, 120, 160, 200, 240].map(ms);
         assert_eq!(got, want, "each pass starts a frame after the last one");
+    }
+
+    /// Timestamps from `start` on, as in a WebM cut with its timestamps kept (-copyts).
+    struct Late {
+        inner: FakeDemux,
+        info: VideoInfo,
+        start: Duration,
+    }
+
+    impl Demuxer for Late {
+        fn info(&self) -> &VideoInfo {
+            &self.info
+        }
+        fn next_packet(&mut self) -> PipeResult<Option<Packet>> {
+            let start = self.start;
+            Ok(self.inner.next_packet()?.map(|p| Packet {
+                pts: p.pts + start,
+                ..p
+            }))
+        }
+        fn rewind(&mut self) -> PipeResult<()> {
+            self.inner.rewind()
+        }
+    }
+
+    #[test]
+    fn a_loop_of_a_video_that_starts_late_has_no_pause() {
+        let ms = Duration::from_millis;
+        let start = Duration::from_secs(600);
+        // the container's duration as ffmpeg writes it (where the file ends), as a length,
+        // and none at all
+        for duration in [Some(start + ms(80)), Some(ms(80)), None] {
+            let inner = FakeDemux::new(2, ms(40));
+            let info = VideoInfo {
+                duration,
+                ..inner.info().clone()
+            };
+            let mut p = Pipeline::new(
+                Box::new(Late { inner, info, start }),
+                Box::new(FakeDecoder::default()),
+                true,
+            );
+            let got: Vec<_> = (0..5)
+                .map(|_| pts(p.next_frame().unwrap()).unwrap() - start)
+                .collect();
+            assert_eq!(got, [0, 40, 80, 120, 160].map(ms), "duration {duration:?}");
+        }
     }
 
     #[test]

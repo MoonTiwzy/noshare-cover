@@ -97,9 +97,10 @@ namespace nsc {
             const auto shared = [](const PHLMONITORREF& ref) { return beingCaptured(ref.lock()); };
             if (g_pHyprRenderer) {
                 // A cover's area is repainted when the cover has a new frame, so a 24 fps video
-                // has the monitor render 24 times a second, and a still not at all. The core is
-                // asked about every cover on a captured monitor, which also keeps a video
-                // decoding from one frame to the next.
+                // has the monitor render 24 times a second, and a still not at all (only when its
+                // file was replaced). The core is asked about every cover on a captured monitor,
+                // which also keeps a video decoding from one frame to the next and has the core
+                // look at the file of a still one.
                 for (const auto& a : g_animBoxes) {
                     if (!shared(a.mon))
                         continue;

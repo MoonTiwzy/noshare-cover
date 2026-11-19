@@ -378,17 +378,19 @@ mod tests {
             true,
         );
         let mut s = VideoSource::spawn(pipe, 1.0, "slow".into());
-        // long enough to fall behind by more than DROP_LATE and then some
-        let end = Instant::now() + Duration::from_millis(1500);
+        // It used to stop for good after the first three or four. Now it shows one of every
+        // few frames it decodes, however slowly that goes on a busy machine: wait for well
+        // more than four, with a deadline only for when they never come.
+        const WANTED: u32 = 12;
+        let end = Instant::now() + Duration::from_secs(20);
         let mut shown = 0;
-        while Instant::now() < end {
+        while shown < WANTED && Instant::now() < end {
             if s.poll(Instant::now()).unwrap().is_some() {
                 shown += 1;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        // it used to stop for good after the first three or four
-        assert!(shown >= 8, "only {shown} frames in 1.5 s");
+        assert_eq!(shown, WANTED, "only {shown} frames");
     }
 
     #[test]

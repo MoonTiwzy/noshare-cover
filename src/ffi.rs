@@ -285,20 +285,14 @@ pub extern "C" fn nsc_end_frame() {
     })
 }
 
-/// Whether any cover shown in the last second is animated (video/GIF).
-#[unsafe(no_mangle)]
-pub extern "C" fn nsc_animating() -> bool {
-    guard(false, || {
-        state()
-            .as_ref()
-            .is_some_and(|r| r.animating(Instant::now()))
-    })
-}
-
-/// Milliseconds until cover `id` has a new frame: 0 = it has one now, -1 = its picture
-/// won't change (a still, a video that ended, no such cover). Rounded up, so waiting that
-/// long is enough. The shim repaints a captured monitor by this; asking also keeps a
-/// video decoding between two frames, so the shim asks for as long as the cover is shown.
+/// Milliseconds until cover `id` has something new to show: 0 = it has it now, -1 = no
+/// such cover. Rounded up, so waiting that long is enough. A cover whose picture doesn't
+/// change by itself (a still, a video that ended, a missing or broken file) is due when
+/// its file is looked at next: asking is what looks at it on a still screen, and it is 0
+/// only once there is a new picture. Asked by the id it had before its file was opened
+/// again, it is 0: that box still shows the earlier picture. The shim repaints a captured
+/// monitor by this; asking also keeps a video decoding between two frames, so the shim
+/// asks for as long as the cover is shown.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsc_next_frame_ms(id: u64) -> i32 {
     guard(-1, || {
@@ -454,18 +448,32 @@ mod tests {
             height: 0,
         };
         let mut out = NscFrame::empty();
+        let end = || std::time::Instant::now() + std::time::Duration::from_secs(5);
         // covers are opened on a loader thread: resolve until the first frame lands
         let resolve = |req: &NscPlayRequest, out: &mut NscFrame| {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let end = end();
             loop {
                 nsc_begin_frame();
                 if unsafe { nsc_resolve(req, out) } {
                     return true;
                 }
                 nsc_end_frame();
-                // nothing is being opened any more (missing file, error): settled
-                if !nsc_animating() || std::time::Instant::now() > end {
+                if std::time::Instant::now() > end {
                     return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        // a cover that can't be drawn: resolve until the core says why, into buf
+        let notified = |req: &NscPlayRequest, out: &mut NscFrame, buf: &mut [c_char]| {
+            let end = end();
+            loop {
+                nsc_begin_frame();
+                assert!(!unsafe { nsc_resolve(req, out) });
+                nsc_end_frame();
+                let n = unsafe { nsc_take_notification(buf.as_mut_ptr(), buf.len()) };
+                if n > 0 || std::time::Instant::now() > end {
+                    return n;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -478,7 +486,11 @@ mod tests {
         let px = unsafe { std::slice::from_raw_parts(out.pixels, 4) };
         assert_eq!(px, &[0, 255, 0, 255]);
         assert!(nsc_cover_alive(out.cover_id));
-        assert_eq!(nsc_next_frame_ms(out.cover_id), -1, "a still never changes");
+        let still = nsc_next_frame_ms(out.cover_id);
+        assert!(
+            (1..=1000).contains(&still),
+            "a still: nothing to repaint, its file is looked at again within a second ({still})"
+        );
         assert_eq!(nsc_next_frame_ms(out.cover_id + 1000), -1, "no such cover");
         nsc_end_frame();
 
@@ -491,10 +503,8 @@ mod tests {
             width: 0,
             height: 0,
         };
-        assert!(!resolve(&req2, &mut out));
-        nsc_end_frame();
         let mut buf = [0 as c_char; 256];
-        let n = unsafe { nsc_take_notification(buf.as_mut_ptr(), buf.len()) };
+        let n = notified(&req2, &mut out, &mut buf);
         assert!(n > 0);
         let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
         assert!(msg.contains("file not found"), "{msg}");
@@ -512,10 +522,9 @@ mod tests {
             width: 0,
             height: 0,
         };
-        resolve(&req3, &mut out);
         let mut small = [0 as c_char; 8];
-        let n = unsafe { nsc_take_notification(small.as_mut_ptr(), small.len()) };
-        assert!(n < 8);
+        let n = notified(&req3, &mut out, &mut small);
+        assert!(n > 0 && n < 8);
         assert!(unsafe { CStr::from_ptr(small.as_ptr()) }.to_str().is_ok());
 
         nsc_shutdown();

@@ -55,9 +55,10 @@ namespace nsc {
         // What the core was last given (see pushSettings).
         struct SPushed {
             std::string path, backend, gpu;
-            bool        loop  = true;
-            double      speed = 1.0;
-            uint64_t    dev   = 0;
+            bool        noFile = false; // path is cleared then: "" and "blur" differ only here
+            bool        loop   = true;
+            double      speed  = 1.0;
+            uint64_t    dev    = 0;
             bool        operator==(const SPushed&) const = default;
         };
         std::optional<SPushed>                g_pushed;
@@ -167,9 +168,11 @@ namespace nsc {
                 continue;
             if (rest.empty())
                 return {kind, def};
-            // "blur 40", and "blur 40.5" or "blur 1e9" too: the strength is whole and has limits
+            // "blur 40", and "blur 40.5" or "blur 1e9" too: the strength is whole and has limits.
+            // from_chars also takes "nan" and "inf", which are no strength.
             double n = 0;
-            if (kind != SCoverKind::TRANSPARENT && std::from_chars(rest.data(), rest.data() + rest.size(), n) == std::from_chars_result{rest.data() + rest.size(), std::errc{}})
+            if (kind != SCoverKind::TRANSPARENT && std::from_chars(rest.data(), rest.data() + rest.size(), n) == std::from_chars_result{rest.data() + rest.size(), std::errc{}} &&
+                std::isfinite(n))
                 return {kind, int(std::clamp(std::round(n), 2.0, 512.0))};
         }
         return {}; // a file, even if it happens to be called "blur x"
@@ -186,8 +189,8 @@ namespace nsc {
         };
         // the core never gets the words: such surfaces are never resolved, and the core
         // must not open the default file in their place
-        const bool noFile = coverKind(now.path).kind != SCoverKind::MEDIA;
-        if (noFile)
+        now.noFile = coverKind(now.path).kind != SCoverKind::MEDIA;
+        if (now.noFile)
             now.path.clear();
 
         // This runs for every capture frame, and nearly always nothing changed: then the core
@@ -200,7 +203,7 @@ namespace nsc {
         const nsc_settings s{
             .path_cover = now.path.c_str(),
             .loop       = now.loop,
-            .no_file    = noFile,
+            .no_file    = now.noFile,
             .speed      = now.speed,
             .backend    = now.backend.c_str(),
             .gpu_device = now.gpu.c_str(),

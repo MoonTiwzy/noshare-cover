@@ -11,8 +11,9 @@ pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// Increments with every new source frame. The shim updates the texture
-    /// only when this number changes.
+    /// Increments with every new source frame, from 1. The shim updates the texture
+    /// only when this number changes. 0 marks an earlier source's picture kept up
+    /// under a new cover id until the new source has its first frame (see `Registry`).
     pub generation: u64,
     pub data: FrameData,
 }

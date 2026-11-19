@@ -260,7 +260,7 @@ mod tests {
         };
         let (s, err) = Settings::from_raw(&raw);
         assert_eq!(s.path_cover, PathBuf::new());
-        assert!(err.is_none() || raw.backend.is_empty());
+        assert!(err.is_none());
     }
 
     #[test]

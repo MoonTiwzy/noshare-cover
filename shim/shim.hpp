@@ -164,7 +164,9 @@ namespace nsc {
     // so on a static monitor (e.g. while you work on another one) the stream
     // would freeze. While the monitor is being captured, the area of every media
     // cover on it is damaged whenever that cover has a new frame (see pumpTick):
-    // the monitor repaints at the cover's frame rate, not at a fixed one.
+    // the monitor repaints at the cover's frame rate, not at a fixed one. A still
+    // cover only when its file was replaced: the same question has the core look at
+    // the file, which no capture frame would do on a static monitor.
     // A stream waiting for its next frame counts as capturing (see beingCaptured),
     // not only a recent frame: otherwise a pause in frames would stop the pump and
     // nothing could wake it up again.

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A cover that plays keeps a still monitor repainting while it is captured, at the cover's
 # own pace: a stream of a 10 fps video cover gets about 10 frames a second and a 30 fps one
-# about 30 (not the 60 of a fixed timer), and a picture that doesn't change gets none.
+# about 30 (not the 60 of a fixed timer), and a picture that doesn't change gets none, until
+# its file is replaced on disk: then the stream gets the new picture.
 #
 #   tests/e2e/pump.sh <libnoshare-cover.so>
 #
@@ -91,6 +92,22 @@ echo "== a still cover leaves the monitor alone"
 write_config "$WORK/still.png"; hctl reload >/dev/null; sleep 2
 read -r n fps <<<"$(stream_fps still)"
 [ "$n" -le 5 ] && pass "still cover: $n frames in 5 s" || fail "still cover: the monitor kept repainting ($n frames in 5 s)"
+
+echo "== a still cover replaced on disk shows up on a static monitor"
+# Nothing repaints by itself: the stream only gets a frame when the new picture is there.
+wf-recorder -f "$WORK/replaced.mkv" -c libx264 >/dev/null 2>&1 &
+rec=$!
+sleep 1.5
+magick -size 320x180 xc:'#ff8000' "$WORK/still.png" # orange, no blue (the old one is all blue)
+sleep 5
+kill -INT "$rec"; wait "$rec" 2>/dev/null
+sleep 0.6
+ffmpeg -loglevel error -y -i "$WORK/replaced.mkv" -update 1 "$WORK/replaced-last.png" 2>/dev/null
+IFS='x+' read -r w h x y <<<"$(win_box cover-me)"
+cx=$((x + w / 2)); cy=$((y + h / 2))
+read -r red blue <<<"$(magick "$WORK/replaced-last.png" -format "%[fx:int(255*p{$cx,$cy}.r)] %[fx:int(255*p{$cx,$cy}.b)]" info: 2>/dev/null)"
+[ "${red:-0}" -gt 180 ] && [ "${blue:-255}" -lt 80 ] && pass "replaced still: the stream shows the new picture (red $red, blue $blue)" ||
+    fail "replaced still: the stream's last frame has red ${red:-?}, blue ${blue:-?} at the window (want the new orange)"
 
 pkill -xu "$(id -u)" Hyprland
 echo

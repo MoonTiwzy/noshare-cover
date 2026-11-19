@@ -100,26 +100,51 @@ namespace nsc {
             g_pHyprRenderer->draw(ctx, CRectPassElement::SRectData{.box = box, .color = CHyprColor{0.F, 0.F, 0.F, 1.F}, .round = round, .roundingPower = roundingPower}, area);
         }
 
-        // drawEffect's intermediate buffers by size, dropped after a while unused (pruneTextures)
+        // drawEffect's intermediate buffers by size, per monitor, dropped after a while unused
+        // (fxBuffer, pruneTextures)
         struct SFxBuffer {
             SP<Render::IFramebuffer> fb;
-            uint64_t                 used = 0;
+            uint64_t                 used        = 0; // g_frameCount then
+            uintptr_t                stream      = 0; // the capture stream that used it last
+            uint64_t                 streamFrame = 0; // that stream's frame then
         };
 
-        std::map<std::pair<int, int>, SFxBuffer> g_fxBuffers;
+        // Capture streams (a client's session on a monitor) take turns, at their own rates
+        // and each with the hidden windows it sees as they are (revealFor), so each needs
+        // sizes the others may not: a buffer ages only by the frames of the stream that used
+        // it last, never by another monitor's or another client's.
+        struct SFxStream {
+            uint64_t frames = 0; // its capture frames so far
+            uint64_t seen   = 0; // g_frameCount at its last one
+        };
 
-        SP<Render::IFramebuffer> fxBuffer(const Vector2D& size, const SP<Render::ITexture>& like) {
+        struct SMonitorFx {
+            std::unordered_map<uintptr_t, SFxStream> streams; // by session (see paintCovers)
+            std::map<std::pair<int, int>, SFxBuffer> buffers;
+        };
+
+        std::unordered_map<MONITORID, SMonitorFx> g_fx;
+        uintptr_t                                 g_fxStream = 0; // the stream being drawn
+
+        SP<Render::IFramebuffer> fxBuffer(const PHLMONITOR& mon, const Vector2D& size, const SP<Render::ITexture>& like) {
+            auto& fx = g_fx[mon ? mon->m_id : MONITOR_INVALID];
             // a box that changes size every frame (an animation, a resize) asks for new sizes
-            // every frame: don't keep those of earlier frames around for long
-            if (g_fxBuffers.size() > 32)
-                std::erase_if(g_fxBuffers, [](const auto& kv) { return kv.second.used + 1 < g_frameCount; });
-            auto& b = g_fxBuffers[{int(size.x), int(size.y)}];
+            // every frame: don't keep those the stream that used them last has drawn a frame
+            // without since
+            if (fx.buffers.size() > 32)
+                std::erase_if(fx.buffers, [&](const auto& kv) {
+                    const auto s = fx.streams.find(kv.second.stream);
+                    return s == fx.streams.end() || kv.second.streamFrame + 1 < s->second.frames;
+                });
+            auto& b = fx.buffers[{int(size.x), int(size.y)}];
             if (!b.fb)
                 b.fb = g_pHyprRenderer->createFB("noshare-cover effect");
             if (!b.fb || !b.fb->alloc(int(size.x), int(size.y)))
                 return nullptr;
             b.fb->setImageDescription(like->m_imageDescription);
-            b.used = g_frameCount;
+            b.used        = g_frameCount;
+            b.stream      = g_fxStream;
+            b.streamFrame = fx.streams[g_fxStream].frames;
             return b.fb;
         }
 
@@ -149,6 +174,7 @@ namespace nsc {
 
             SP<Render::ITexture> tex  = image;
             CBox                 from = src; // the part of tex that is wanted
+            const auto           mon  = ctx.m_data.pMonitor.lock();
             {
                 const auto                          viewport = ctx.m_data.fbSize;
                 const Hyprutils::Utils::CScopeGuard restoreViewport{[&] { g_pHyprRenderer->setViewport(0, 0, viewport.x, viewport.y); }};
@@ -156,7 +182,7 @@ namespace nsc {
                 ctx.m_data.renderModif.enabled            = false;
                 ctx.m_data.useNearestNeighbor             = false;
                 for (const auto& size : steps) {
-                    const auto fb = fxBuffer(size, image);
+                    const auto fb = fxBuffer(mon, size, image);
                     if (!fb)
                         return false;
                     const auto    bound = g_pHyprRenderer->bindTempFB(ctx, fb);
@@ -291,7 +317,11 @@ namespace nsc {
             if (++g_frameCount % 120 != 0)
                 return;
             std::erase_if(g_textures, [](const auto& kv) { return !nsc_cover_alive(kv.first); });
-            std::erase_if(g_fxBuffers, [](const auto& kv) { return kv.second.used + 120 < g_frameCount; });
+            for (auto& [id, fx] : g_fx) {
+                std::erase_if(fx.buffers, [](const auto& kv) { return kv.second.used + 120 < g_frameCount; });
+                std::erase_if(fx.streams, [](const auto& kv) { return kv.second.seen + 120 < g_frameCount; });
+            }
+            std::erase_if(g_fx, [](const auto& kv) { return kv.second.buffers.empty() && kv.second.streams.empty(); });
         }
 
         void paintExtraRects(Render::CRenderContext& ctx, const PHLMONITOR& mon, const Vector2D& capturePos) {
@@ -552,6 +582,13 @@ namespace nsc {
 
         pushSettings();
         nsc_begin_frame();
+        // the session is owned by the manager: its weak pointer is only read (see captureClient)
+        g_fxStream = reinterpret_cast<uintptr_t>(frame->m_session.get());
+        {
+            auto& s = g_fx[mon->m_id].streams[g_fxStream];
+            ++s.frames;
+            s.seen = g_frameCount;
+        }
         // rebuild this monitor's covers, leave other monitors alone
         std::erase_if(g_animBoxes, [&](const SAnimBox& a) { return a.mon.expired() || a.mon.lock() == mon; });
         NSC_TRACE("frame: monitor %s\n", mon->m_name.c_str());
@@ -656,7 +693,7 @@ namespace nsc {
                 cover = paintCover(ctx, image, what, rules, geo.area, capturePos, 0, 2.F, clip);
             else if (!bent)
                 cover = paintCover(ctx, image, what, rules, box, capturePos, round, roundingPower, clip);
-            // media that plays has the monitor repainted for its frames (see pumpTick)
+            // media has the monitor repainted for its new frames (see pumpTick)
             if (cover)
                 g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}, cover});
             drawn.emplace_back(i, clip);
@@ -761,7 +798,7 @@ namespace nsc {
 
         paintExtraRects(ctx, mon, capturePos);
         nsc_end_frame();
-        if ((!g_animBoxes.empty() && nsc_animating()) || !g_closing.empty())
+        if (!g_animBoxes.empty() || !g_closing.empty())
             startPump();
         pruneTextures();
         drainNotifications();
@@ -769,7 +806,7 @@ namespace nsc {
 
     void releasePaint() {
         g_bentSource.reset();
-        g_fxBuffers.clear();
+        g_fx.clear();
         g_textures.clear();
     }
 

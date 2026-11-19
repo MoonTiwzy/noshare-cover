@@ -191,6 +191,9 @@ impl Demuxer for Mp4Demux {
 
 pub struct MkvDemux {
     mkv: matroska_demuxer::MatroskaFile<BufReader<File>>,
+    /// The open file, read again from its start on a rewind: the same file even if the path
+    /// is another one by then.
+    file: File,
     track: u64,
     /// nanoseconds per Matroska time unit
     scale_ns: u64,
@@ -204,8 +207,7 @@ pub struct MkvDemux {
 impl MkvDemux {
     pub fn open(path: &Path) -> PipeResult<Self> {
         let file = File::open(path).map_err(|e| e.to_string())?;
-        let mkv = matroska_demuxer::MatroskaFile::open(BufReader::new(file))
-            .map_err(|e| format!("MKV: {e}"))?;
+        let mkv = Self::read(&file)?;
 
         let entry = mkv
             .tracks()
@@ -240,7 +242,16 @@ impl MkvDemux {
             frame: Default::default(),
             first: true,
             mkv,
+            file,
         })
+    }
+
+    /// Reads the file from its start, through a handle of its own. The handles share the
+    /// file's position, and only the reader in use moves it.
+    fn read(file: &File) -> PipeResult<matroska_demuxer::MatroskaFile<BufReader<File>>> {
+        let mut file = file.try_clone().map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        matroska_demuxer::MatroskaFile::open(BufReader::new(file)).map_err(|e| format!("MKV: {e}"))
     }
 }
 
@@ -287,7 +298,12 @@ impl Demuxer for MkvDemux {
 
     fn rewind(&mut self) -> PipeResult<()> {
         self.first = true;
-        self.mkv.seek(0).map_err(|e| format!("MKV seek: {e}"))
+        // Not a seek: without Cues it goes by the clusters' timestamps and finds nothing when
+        // the one cluster starts before the time asked for (the video starts after another
+        // track's blocks) or after it (a file cut with its timestamps kept starts minutes in,
+        // not at zero). Opened again, the file is read from its first cluster, as at first.
+        self.mkv = Self::read(&self.file)?;
+        Ok(())
     }
 }
 
@@ -307,6 +323,155 @@ mod tests {
     fn missing_file_is_error() {
         assert!(open(Path::new("/nonexistent/x.mp4")).is_err());
         assert!(open(Path::new("/nonexistent/x.avi")).is_err());
+    }
+
+    /// A block of a test WebM: its track and its time in ms after its cluster's.
+    type Block = (u8, u16);
+
+    /// A WebM in one cluster at `cluster` ms and without Cues, as one written to a pipe:
+    /// VP9 frames on track 1 and Opus packets on track 2, its duration written as ffmpeg
+    /// writes it (where the file ends).
+    fn write_webm(path: &Path, cluster: u64, blocks: &[Block], end_ms: u64) {
+        // every element with an 8-byte size, which any EBML reader takes
+        fn el(id: &[u8], body: &[u8]) -> Vec<u8> {
+            let mut v = id.to_vec();
+            v.push(0x01);
+            v.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+            v.extend_from_slice(body);
+            v
+        }
+        let uint = |id: &[u8], n: u64| el(id, &n.to_be_bytes());
+        let header = [
+            uint(&[0x42, 0x86], 1), // EBMLVersion
+            uint(&[0x42, 0xF7], 1), // EBMLReadVersion
+            uint(&[0x42, 0xF2], 4), // EBMLMaxIDLength
+            uint(&[0x42, 0xF3], 8), // EBMLMaxSizeLength
+            el(&[0x42, 0x82], b"webm"),
+            uint(&[0x42, 0x87], 4), // DocTypeVersion
+            uint(&[0x42, 0x85], 2), // DocTypeReadVersion
+        ]
+        .concat();
+        let info = [
+            uint(&[0x2A, 0xD7, 0xB1], 1_000_000), // TimestampScale: milliseconds
+            el(&[0x44, 0x89], &(end_ms as f64).to_be_bytes()), // Duration
+            el(&[0x4D, 0x80], b"test"),           // MuxingApp
+            el(&[0x57, 0x41], b"test"),           // WritingApp
+        ]
+        .concat();
+        let video = [uint(&[0xB0], 2), uint(&[0xBA], 2)].concat(); // PixelWidth, PixelHeight
+        let tracks = [
+            [
+                uint(&[0xD7], 1),       // TrackNumber
+                uint(&[0x73, 0xC5], 1), // TrackUID
+                uint(&[0x83], 1),       // TrackType: video
+                el(&[0x86], b"V_VP9"),
+                el(&[0xE0], &video),
+            ]
+            .concat(),
+            [
+                uint(&[0xD7], 2),
+                uint(&[0x73, 0xC5], 2),
+                uint(&[0x83], 2), // audio
+                el(&[0x86], b"A_OPUS"),
+            ]
+            .concat(),
+        ]
+        .map(|t| el(&[0xAE], &t))
+        .concat();
+        let mut body = uint(&[0xE7], cluster); // Timestamp
+        for (n, &(track, rel)) in blocks.iter().enumerate() {
+            // the track, the timestamp relative to the cluster, keyframe flag, the block's number
+            let [hi, lo] = rel.to_be_bytes();
+            body.extend(el(&[0xA3], &[0x80 | track, hi, lo, 0x80, n as u8]));
+        }
+        let segment = [
+            el(&[0x15, 0x49, 0xA9, 0x66], &info),
+            el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
+            el(&[0x1F, 0x43, 0xB6, 0x75], &body),
+        ]
+        .concat();
+        let file = [
+            el(&[0x1A, 0x45, 0xDF, 0xA3], &header),
+            el(&[0x18, 0x53, 0x80, 0x67], &segment),
+        ]
+        .concat();
+        std::fs::write(path, file).unwrap();
+    }
+
+    /// A rewind reads the file again from its first block, wherever that is: a seek finds
+    /// nothing in a file without Cues whose one cluster starts before or after the time it
+    /// is asked for.
+    #[test]
+    fn a_webm_is_read_again_from_its_start_however_it_begins() {
+        let dir = std::env::temp_dir().join(format!("nsc-demux-rewind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ms = Duration::from_millis;
+        let (v, a) = (1, 2);
+        // the cluster's timestamp and its blocks; the video always has three 40 ms frames
+        let files: [(&str, u64, &[Block]); 5] = [
+            // cut with its timestamps kept (-copyts): it starts 600 s in
+            ("late", 600_000, &[(v, 0), (v, 40), (v, 80)]),
+            // the video starts after the cluster does
+            ("offset", 0, &[(v, 40), (v, 80), (v, 120)]),
+            // another track's blocks come first
+            (
+                "audio first",
+                0,
+                &[(a, 0), (a, 20), (v, 40), (a, 40), (v, 80), (v, 120)],
+            ),
+            (
+                "late, audio first",
+                600_000,
+                &[(a, 0), (v, 40), (a, 40), (v, 80), (v, 120)],
+            ),
+            ("late, offset", 600_000, &[(v, 40), (v, 80), (v, 120)]),
+        ];
+        for (name, cluster, blocks) in files {
+            let path = dir.join(format!("{name}.webm"));
+            let video: Vec<u64> = blocks
+                .iter()
+                .filter(|b| b.0 == v)
+                .map(|b| cluster + u64::from(b.1))
+                .collect();
+            let end = video[2] + 40;
+            write_webm(&path, cluster, blocks, end);
+
+            let mut d = open(&path).unwrap();
+            assert_eq!(d.info().duration, Some(ms(end)), "{name}: where it ends");
+            let pass = |d: &mut Box<dyn Demuxer>| {
+                std::iter::from_fn(|| d.next_packet().unwrap())
+                    .map(|p| (p.pts, p.data))
+                    .collect::<Vec<_>>()
+            };
+            let first = pass(&mut d);
+            let pts: Vec<_> = first.iter().map(|p| p.0).collect();
+            assert_eq!(
+                pts,
+                video.iter().map(|&t| ms(t)).collect::<Vec<_>>(),
+                "{name}"
+            );
+            d.rewind().unwrap();
+            assert_eq!(
+                pass(&mut d),
+                first,
+                "{name}: read again from its first frame"
+            );
+            d.rewind().unwrap();
+            assert_eq!(pass(&mut d), first, "{name}: and again");
+
+            // and a loop goes on without a pause (its duration is where it ends, not a length)
+            use crate::media::video::pipeline::{Next, Pipeline, testing::FakeDecoder};
+            d.rewind().unwrap();
+            let mut p = Pipeline::new(d, Box::new(FakeDecoder::default()), true);
+            let got: Vec<_> = (0..6)
+                .map(|_| match p.next_frame() {
+                    Ok(Next::Frame(f)) => f.pts - ms(video[0]),
+                    other => panic!("{name}: it loops, got {:?}", other.err()),
+                })
+                .collect();
+            assert_eq!(got, [0, 40, 80, 120, 160, 200].map(ms), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Real clips from `NSC_TEST_MEDIA` (10 s, 640x360). Without the directory the test is skipped.
