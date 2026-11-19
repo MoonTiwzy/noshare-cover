@@ -194,15 +194,16 @@ Without `no_screen_share` the window is not covered. If several rules match, the
 A window placed on top of a hidden one stays visible in the stream: the cover (or the black box)
 is drawn only where the hidden window actually shows. Under a translucent window on top the
 cover is drawn too and the window is drawn again over it, with its own opacity and blur, so what
-shows through it is the cover, never the hidden window. Layers above windows (bars, launchers,
+shows through it is the cover, never the hidden window. Its border, which lies outside the
+window, is drawn again over the cover as well. Layers above windows (bars, launchers,
 notifications) are drawn again over the cover the same way.
 
 With `decoration:wobble` Hyprland bends a window while it moves. Its cover bends with it, the
 same way (the cover takes the window's own transformers), so the window never shows from
 behind a cover that stands still; a window that wobbles above a hidden one is drawn again over
-the cover, bent as it is. `blur` and `pixelate` are made of the picture, which has the window
-bent already: they go over the area the bent window is in. `decoration:motion_blur` is not
-followed: the trail of a hidden window stays outside its cover.
+the cover, bent as it is (its border is not). `blur` and `pixelate` are made of the picture,
+which has the window bent already: they go over the area the bent window is in.
+`decoration:motion_blur` is not followed: the trail of a hidden window stays outside its cover.
 
 When a window or layer closes, Hyprland replaces it with a snapshot for the close animation,
 and `no_screen_share` does not apply to that snapshot, so without the plugin its content

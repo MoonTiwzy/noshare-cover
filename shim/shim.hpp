@@ -116,6 +116,15 @@
 #include "managers/screenshare/ScreenshareManager.hpp"
 #undef private
 
+// A window's border is drawn again over a cover below it (see paint.cpp) in the colours it
+// has at that moment, which its decoration keeps private. What the header pulls in comes
+// first, so `private public` only affects its own class.
+#include "render/decorations/AnimatedDecorationGradient.hpp"
+#include "render/decorations/IHyprWindowDecoration.hpp"
+#define private public
+#include "render/decorations/CHyprBorderDecoration.hpp"
+#undef private
+
 // Hidden: these are the plugin's own symbols, not an API (that is main.cpp's extern "C").
 // Only this namespace: Hyprland's inline globals must stay bound to the compositor's copy.
 #pragma GCC visibility push(hidden)

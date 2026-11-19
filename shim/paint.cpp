@@ -428,6 +428,64 @@ namespace nsc {
                 nullptr);
         }
 
+        // Draw a window's border again (CHyprBorderDecoration::draw: the ring around its box,
+        // its colours as they are right now, fading or turning included), limited to clip.
+        // Used for windows above a hidden one, after redrawWindow: the cover below went over
+        // the ring too, which lies outside the window's box.
+        void redrawBorder(Render::CRenderContext& ctx, const PHLWINDOW& w, const SWinGeo& geo, const CRegion& clip, const PHLMONITOR& mon) {
+            const auto deco = w->presentation().decoration(DECORATION_BORDER);
+            // only Hyprland's own border decoration has this type
+            auto* const border = static_cast<CHyprBorderDecoration*>(deco.get());
+            if (!border || border->doesntWantBorders() || geo.box.w < 1 || geo.box.h < 1)
+                return;
+            if (border->m_assignedGeometry.width < border->m_extents.topLeft.x + 1 || border->m_assignedGeometry.height < border->m_extents.topLeft.y + 1)
+                return;
+            const int    logical = border->borderSize();
+            const double zoom    = zoomScale(mon);
+            // renderBorder takes the size in logical pixels and scales it by the monitor;
+            // the zoom is ours to add, as for the box
+            const int size = int(std::lround(logical * zoom));
+            if (size < 1)
+                return;
+            CRegion region{clip};
+            region.intersect(CRegion{geo.box.copy().expand(std::round(size * mon->m_scale))});
+            if (region.empty())
+                return;
+
+            CBorderPassElement::SBorderData data;
+            data.box = geo.box;
+            // the corners are only rounded where the window is (see SWinGeo::round): the
+            // shader finds them by the screen position, which a region capture shifts
+            if (geo.round > 0) {
+                const double power   = geo.roundingPower;
+                const double correct = logical * (M_SQRT2 - 1) * std::max(2.0 - power, 0.0);
+                data.round           = geo.round;
+                data.outerRound      = int(std::lround((w->presentation().rounding() + logical - correct) * mon->m_scale * zoom));
+            } else {
+                data.round      = 0;
+                data.outerRound = 0;
+            }
+            data.roundingPower = geo.roundingPower;
+            data.borderSize    = size;
+            data.a             = windowAlpha(w);
+            data.window        = w;
+            const auto colours = border->m_gradient.renderState();
+            data.grad1         = colours.current;
+            if (colours.transitioning) {
+                data.hasGrad2 = true;
+                data.grad1    = colours.previous;
+                data.grad2    = colours.current;
+                data.lerp     = colours.progress;
+            }
+
+            // the border is drawn within the frame's damage, not the region it is given
+            auto&                               damage = ctx.m_data.damage;
+            const Hyprutils::Utils::CScopeGuard restore{[&, saved = damage] { damage = saved; }};
+            damage = region;
+            NSC_TRACE("window %s: border drawn again over a cover\n", windowClass(w).c_str());
+            g_pHyprRenderer->draw(ctx, data, region);
+        }
+
         // A window that wobbles isn't in its box: Hyprland draws it into a buffer of its own
         // and bends that through the window's transformers. Whatever goes over such a window
         // in the capture, its cover or the window itself drawn again, takes the same way, or
@@ -805,7 +863,8 @@ namespace nsc {
         // the hidden window. An opaque one only in its rounded corners: a cover below it is
         // cut along its box, corners left in (subtractRounded), and the rounding is drawn
         // again here over the cover there (square in a region capture, see SWinGeo::corner:
-        // the corners then show the window, never what was below them).
+        // the corners then show the window, never what was below them). Then its border, the
+        // ring around its box, over covers below it there (not for a window that wobbles).
         if (!drawn.empty()) {
             for (const size_t j : order) {
                 // Never redraw a hidden window from its real content. This also catches
@@ -813,28 +872,33 @@ namespace nsc {
                 const auto& wj = visible[j].w;
                 if (!wj || !wj->m_ruleApplicator || wj->m_ruleApplicator->noScreenShare().valueOrDefault())
                     continue;
-                CRegion region;
+                CRegion below; // covers below it, where nothing above it hides them
                 for (const auto& [i, clip] : drawn)
                     if (isAbove(j, i))
-                        region.add(clip);
-                if (region.empty())
+                        below.add(clip);
+                if (below.empty())
                     continue;
-                region.intersect(CRegion{visible[j].geo.area});
                 for (size_t k = 0; k < visible.size(); ++k)
                     if (isAbove(k, j) && visible[k].geo.opaque && !visible[k].gone)
-                        subtractRounded(region, visible[k].geo.box, visible[k].geo.corner);
+                        subtractRounded(below, visible[k].geo.box, visible[k].geo.corner);
                 for (const auto& [i, clip] : drawn)
                     if (isAbove(i, j))
-                        region.subtract(clip);
-                if (region.empty())
+                        below.subtract(clip);
+                if (below.empty())
                     continue;
-                NSC_TRACE("window %s: redrawn over a cover\n", windowClass(visible[j].w).c_str());
-                const bool bent = visible[j].geo.bent && drawBent(ctx, wj, mon, capturePos, region, [&](const CBox& canvas) {
-                    const auto origin = canvas.pos();
-                    redrawWindow(ctx, wj, visible[j].geo, CRegion{CBox{{}, canvas.size()}}, mon, capturePos, &origin);
-                });
-                if (!bent)
-                    redrawWindow(ctx, wj, visible[j].geo, region, mon, capturePos);
+                CRegion region{below};
+                region.intersect(CRegion{visible[j].geo.area});
+                if (!region.empty()) {
+                    NSC_TRACE("window %s: redrawn over a cover\n", windowClass(visible[j].w).c_str());
+                    const bool bent = visible[j].geo.bent && drawBent(ctx, wj, mon, capturePos, region, [&](const CBox& canvas) {
+                        const auto origin = canvas.pos();
+                        redrawWindow(ctx, wj, visible[j].geo, CRegion{CBox{{}, canvas.size()}}, mon, capturePos, &origin);
+                    });
+                    if (!bent)
+                        redrawWindow(ctx, wj, visible[j].geo, region, mon, capturePos);
+                }
+                if (!visible[j].geo.bent)
+                    redrawBorder(ctx, wj, visible[j].geo, below, mon);
             }
         }
 

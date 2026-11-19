@@ -3,6 +3,8 @@
 #   - an opaque window with rounded corners on top of a hidden one keeps its corners: the
 #     cover goes only where the hidden window shows, outside the rounding; in a region
 #     capture (where nothing is drawn rounded) the hidden window never shows in its corners;
+#   - and its border, edges and rounded corners, which lie outside its box over the hidden
+#     window: the cover goes only outside the border;
 #   - layers: a top layer that isn't hidden stays under a hidden overlay layer's cover, an
 #     overlay layer that isn't hidden stays over a hidden top layer's cover;
 #   - a closing tiled window's cover stays under a floating window above it (Hyprland draws
@@ -28,13 +30,16 @@ fail() { printf '  \e[31mFAIL\e[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
 magick -size 640x360 xc:'#ff00ff' "$WORK/cover.png"
 R=30 # rounding
 
-write_config() { # $1: animations (true/false), $2: close_hold ms (default 0)
+write_config() { # $1: animations (true/false), $2: close_hold ms (default 0), $3: border size (default 0)
     cat > "$WORK/hypr.lua" <<LUA
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "1" })
 hl.plugin.load("$PLUGIN")
 hl.config({
     plugin = { no_screen_share_cover = { path_cover = "$WORK/cover.png", close_hold = ${2:-0} } },
-    general = { gaps_in = 0, gaps_out = 0, border_size = 0, layout = "dwindle" },
+    general = {
+        gaps_in = 0, gaps_out = 0, border_size = ${3:-0}, layout = "dwindle",
+        col = { active_border = "rgba(0000ffff)", inactive_border = "rgba(0000ffff)" },
+    },
     decoration = { rounding = $R, shadow = { enabled = false }, blur = { enabled = false } },
     animations = { enabled = $1 },
     misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
@@ -64,8 +69,9 @@ mean_rgb() { magick "$WORK/$1.png" -crop "$2" -resize 1x1\! -format '%[fx:int(25
 is_cover() { read -r r g b <<<"$1"; [ "$r" -gt 200 ] && [ "$g" -lt 60 ] && [ "$b" -gt 200 ]; }
 is_green() { read -r r g b <<<"$1"; [ "$r" -lt 60 ] && [ "$g" -gt 200 ] && [ "$b" -lt 60 ]; }
 is_yellow() { read -r r g b <<<"$1"; [ "$r" -gt 200 ] && [ "$g" -gt 200 ] && [ "$b" -lt 60 ]; }
+is_blue() { read -r r g b <<<"$1"; [ "$r" -lt 60 ] && [ "$g" -lt 60 ] && [ "$b" -gt 200 ]; }
 is_cover_or_green() { is_cover "$1" || is_green "$1"; }
-expect() { # $1 shot, $2 crop, $3 cover|green|yellow|cover_or_green, $4 label
+expect() { # $1 shot, $2 crop, $3 cover|green|yellow|blue|cover_or_green, $4 label
     local c; c=$(mean_rgb "$1" "$2")
     if "is_$3" "$c"; then pass "$4 ($c)"; else fail "$4: want $3, got $c ($WORK/$1.png, $2)"; fi
 }
@@ -124,6 +130,38 @@ for corner in "200 150 1 1" "800 150 -1 1" "200 550 1 -1" "800 550 -1 -1"; do
 done
 expect corners-region "100x100+$((450 - RX))+$((300 - RY))" green "region capture: the window's middle"
 expect corners-region "40x40+$((850 - RX))+$((300 - RY))" cover "region capture: the hidden window next to it is covered"
+
+# The border lies outside the window's box, so the cover went over it, rounded corners and
+# all, and nothing drew it again. A plain blue border, the same focused or not.
+echo "== the border of an opaque window on top of a hidden one"
+B=8
+write_config false 0 "$B"
+hctl reload >/dev/null; sleep 1.5
+read -r W H X Y <<<"$(win_box over | tr 'x+' '  ')"
+[ "${W:-0}" -ge 400 ] || fail "over is at $(win_box over)"
+shot border
+expect border "2x20+$((X - B / 2 - 1))+$((Y + H / 2 - 10))" blue "the left edge of the border"
+expect border "2x20+$((X + W + B / 2 - 1))+$((Y + H / 2 - 10))" blue "the right edge of the border"
+expect border "20x2+$((X + W / 2 - 10))+$((Y - B / 2 - 1))" blue "the top edge of the border"
+expect border "20x2+$((X + W / 2 - 10))+$((Y + H + B / 2 - 1))" blue "the bottom edge of the border"
+expect border "2x20+$((X - B - 6))+$((Y + H / 2 - 10))" cover "the hidden window outside the border is covered"
+# each rounded corner: its middle (45 degrees, halfway through the ring) the border, outside
+# the ring the cover. The ring runs from R to R + B around the point R in from the corner.
+O=$(((R + B / 2) * 707 / 1000))
+for corner in "$X $Y 1 1" "$((X + W)) $Y -1 1" "$X $((Y + H)) 1 -1" "$((X + W)) $((Y + H)) -1 -1"; do
+    read -r cx cy sx sy <<<"$corner"
+    mx=$((cx + sx * (R - O) - 1)); my=$((cy + sy * (R - O) - 1))
+    ox=$((cx - sx * (B - 2) - (sx < 0 ? 2 : 0))); oy=$((cy - sy * (B - 2) - (sy < 0 ? 2 : 0)))
+    expect border "2x2+$mx+$my" blue "corner at $cx,$cy: the border's rounding"
+    expect border "2x2+$ox+$oy" cover "corner at $cx,$cy: the cover outside the border's rounding"
+done
+expect border "100x100+$((X + W / 2 - 50))+$((Y + H / 2 - 50))" green "the window's middle, with a border"
+grep -aq "border drawn again over a cover" "$WORK/trace.log" && pass "the border was drawn again (trace)" ||
+    fail "the border was never drawn again ($WORK/trace.log)"
+# a region capture draws it square, the edges the same
+grim -g "$RX,$RY 800x600" "$WORK/border-region.png"
+expect border-region "2x20+$((X - B / 2 - 1 - RX))+$((Y + H / 2 - 10 - RY))" blue "region capture: the left edge of the border"
+expect border-region "20x2+$((X + W / 2 - 10 - RX))+$((Y - B / 2 - 1 - RY))" blue "region capture: the top edge of the border"
 
 echo "== a closing tiled window's cover under a floating window"
 write_config true
