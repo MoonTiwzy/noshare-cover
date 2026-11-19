@@ -155,14 +155,19 @@ namespace nsc {
         // blur goes back up through the same sizes with linear filtering (smooth).
         bool drawEffect(Render::CRenderContext& ctx, const SP<Render::ITexture>& image, const SCoverKind& kind, const CBox& box, const Vector2D& capturePos, int round, float roundingPower,
                         const CRegion& clip) {
-            if (!image || box.w < 1 || box.h < 1)
+            if (!image || box.w < 1 || box.h < 1 || image->m_size.x < 1 || image->m_size.y < 1)
                 return false;
-            const CBox     src = box.copy().translate(capturePos); // in the image
-            const Vector2D target{std::max(1.0, std::round(src.w / kind.amount)), std::max(1.0, std::round(src.h / kind.amount))};
+            const CBox src = box.copy().translate(capturePos); // in the image
+            // Never a buffer larger than the image, which the GPU has already taken: a zoomed box
+            // is several times the screen, and a buffer past the GPU's texture limit takes the
+            // compositor down (Hyprland asserts on an incomplete framebuffer). A box that large
+            // gets larger blocks than asked for, never smaller ones.
+            const Vector2D target{std::clamp(std::round(src.w / kind.amount), 1.0, std::floor(image->m_size.x)),
+                                  std::clamp(std::round(src.h / kind.amount), 1.0, std::floor(image->m_size.y))};
             // first to target * 2^k, the nearest such size to src, so that every halving after it
             // is exact: one pixel from 2x2
             int k = std::clamp(int(std::lround(std::log2(std::max(src.w / target.x, src.h / target.y)))), 0, 12);
-            // never a buffer larger than the image: a zoomed box is several times the screen
+            // the same for the sizes it is halved from
             while (k > 0 && (target.x * (1 << k) > image->m_size.x || target.y * (1 << k) > image->m_size.y))
                 --k;
             std::vector<Vector2D> steps;
@@ -233,8 +238,10 @@ namespace nsc {
         }
 
         // Window cover for another plugin's rect: same rules as for the window itself.
-        // size: of the rect, in capture pixels.
-        SP<Render::ITexture> coverForWindowAddress(uint64_t address, const Vector2D& size) {
+        // size: of the rect, in capture pixels. cover: the core's id of the media it shows or
+        // waits for (0: none), for the pump.
+        SP<Render::ITexture> coverForWindowAddress(uint64_t address, const Vector2D& size, uint64_t& cover) {
+            cover = 0;
             if (!address)
                 return nullptr;
             for (const auto& w : Desktop::windowState()->windows()) {
@@ -243,9 +250,11 @@ namespace nsc {
                 const auto rules = ruleValuesFor(w);
                 if (coverKind(rules).kind != SCoverKind::MEDIA)
                     return nullptr; // another plugin's picture of it can only be blacked out
-                const auto req = playRequest(rules, size);
+                const auto req   = playRequest(rules, size);
                 nsc_frame  f{};
-                return nsc_resolve(&req, &f) ? textureFor(f) : nullptr;
+                const bool ready = nsc_resolve(&req, &f);
+                cover            = f.cover_id; // also while it is still being opened
+                return ready ? textureFor(f) : nullptr;
             }
             return nullptr;
         }
@@ -324,7 +333,9 @@ namespace nsc {
             std::erase_if(g_fx, [](const auto& kv) { return kv.second.buffers.empty() && kv.second.streams.empty(); });
         }
 
-        void paintExtraRects(Render::CRenderContext& ctx, const PHLMONITOR& mon, const Vector2D& capturePos) {
+        // Rects from other plugins (noshare_cover_api.h): an overview's tiles of hidden windows.
+        // revealed: hidden windows this client sees as they are (see revealFor), tiles too.
+        void paintExtraRects(Render::CRenderContext& ctx, const PHLMONITOR& mon, const Vector2D& capturePos, const std::unordered_set<uintptr_t>& revealed) {
             // Usually a few dozen overlay tiles; if there are more, take as many as reported.
             std::vector<nsc_extra_rect> rects(64);
             size_t                      n = nsc_extra_rects(mon->m_id, rects.data(), rects.size());
@@ -334,14 +345,23 @@ namespace nsc {
             }
 
             for (size_t i = 0; i < n; ++i) {
-                const auto& r     = rects[i];
-                const auto  box   = zoomed(mon, CBox{r.x, r.y, std::max(r.w, 1.0), std::max(r.h, 1.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
-                const int   round = int(std::lround(r.rounding * mon->m_scale * zoomScale(mon)));
+                const auto& r = rects[i];
+                if (r.window && revealed.contains(uintptr_t(r.window)))
+                    continue;
+                const CBox global{r.x, r.y, std::max(r.w, 1.0), std::max(r.h, 1.0)};
+                const auto box   = zoomed(mon, global.copy().translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
+                const int  round = int(std::lround(r.rounding * mon->m_scale * zoomScale(mon)));
                 if (box.w < 1 || box.h < 1)
                     continue;
 
                 if (r.fill == 1) {
-                    if (const auto tex = coverForWindowAddress(r.window, box.size())) {
+                    uint64_t   cover = 0;
+                    const auto tex   = coverForWindowAddress(r.window, box.size(), cover);
+                    // a video plays on the tile, and a cover still being opened shows up there,
+                    // also on a still screen: the pump repaints the tile as for the window
+                    if (cover)
+                        g_animBoxes.push_back({mon, global, cover, g_fxStream});
+                    if (tex) {
                         drawBlack(ctx, box, round); // under the cover's transparent pixels
                         g_pHyprRenderer->draw(ctx, CTexPassElement::SRenderData{.tex = tex, .box = box, .round = round}, box);
                         continue;
@@ -352,7 +372,8 @@ namespace nsc {
         }
 
         // Take an opaque box out of a region, but keep its r x r corners: a rounded window
-        // is transparent there, and whatever is below would show through.
+        // is transparent there, and whatever is below would show through. The window is
+        // drawn again over its corners afterwards (see paintCovers).
         void subtractRounded(CRegion& region, const CBox& b, int r) {
             r = std::clamp(r, 0, int(std::min(b.w, b.h) / 2));
             region.subtract(CBox{b.x + r, b.y, b.w - 2 * r, b.h});
@@ -360,10 +381,11 @@ namespace nsc {
         }
 
         // Draw a window again from its surface textures, with its alpha, rounding and blur,
-        // limited to clip. Used for translucent windows above a hidden one: the cover went
-        // over them, and this puts them back on top of it.
+        // limited to clip. Used for windows above a hidden one: the cover went over them, and
+        // this puts them back on top of it.
         // canvas: draw it as it stands still into a buffer that starts at this monitor pixel
-        // (see drawBent), without blur: there is nothing under it to blur there.
+        // (see drawBent), without blur: there is nothing under it to blur there. Nor under an
+        // opaque window, as in Hyprland.
         void redrawWindow(Render::CRenderContext& ctx, const PHLWINDOW& w, const SWinGeo& geo, const CRegion& clip, const PHLMONITOR& mon, const Vector2D& capturePos,
                           const Vector2D* canvas = nullptr) {
             const auto res = w->resource();
@@ -373,7 +395,7 @@ namespace nsc {
             if (!w->backend().isX11())
                 base -= windowClientGeometryPos(w);
             static auto PBLUR = CConfigValue<Config::INTEGER>("decoration:blur:enabled");
-            const bool  blur  = !canvas && *PBLUR && !(w->m_ruleApplicator && w->m_ruleApplicator->noBlur().valueOrDefault());
+            const bool  blur  = !canvas && !geo.opaque && *PBLUR && !(w->m_ruleApplicator && w->m_ruleApplicator->noBlur().valueOrDefault());
             const int   round = canvas ? int(std::lround(geo.round / zoomScale(mon))) : geo.round;
             const float alpha = windowAlpha(w);
             const float fade  = windowFade(w);
@@ -512,6 +534,23 @@ namespace nsc {
         return cover;
     }
 
+    // Where Hyprland draws a window among the others (renderWorkspaceWindows[Fullscreen]):
+    // tiled, floating, and on a workspace with a fullscreen window that window over both, with
+    // the floating windows that go over it (allowed there, or fading out under it) on top. The
+    // special workspace the same way over the regular one (+4), pinned windows over everything.
+    int windowStack(const PHLWINDOW& w) {
+        if (windowPinned(w))
+            return 8;
+        const auto& fsc         = Fullscreen::controller();
+        const bool  fsWorkspace = fsc && w->m_workspace && fsc->hasFullscreen(w->m_workspace);
+        int         stack       = w->isFloating() ? 1 : 0;
+        if (fsWorkspace && fsc->isFullscreen(w))
+            stack = 2;
+        else if (fsWorkspace && stack == 1 && w->shouldRenderOverFullscreen())
+            stack = 3;
+        return (w->onSpecialWorkspace() ? 4 : 0) + stack;
+    }
+
     std::optional<SWinGeo> windowGeo(const PHLWINDOW& w, const PHLMONITOR& mon, const Vector2D& capturePos) {
         if (!g_pHyprRenderer->shouldRenderWindow(w, mon) || w->isHidden())
             return std::nullopt;
@@ -530,20 +569,11 @@ namespace nsc {
             return std::nullopt;
         const auto& fsc        = Fullscreen::controller();
         const bool  fullscreen = fsc && fsc->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
-        const bool  dontRound  = capturePos != Vector2D{} || fullscreen;
-        g.round                = dontRound ? 0 : int(std::lround(w->presentation().rounding() * mon->m_scale * zoomScale(mon)));
-        g.roundingPower        = dontRound ? 2.F : w->presentation().roundingPower();
-        // Hyprland's order (renderWorkspaceWindows[Fullscreen]): tiled, floating, and on a
-        // workspace with a fullscreen window that window over both, with the floating
-        // windows that go over it (allowed there, or fading out under it) on top. The special
-        // workspace the same way over the regular one, pinned windows over everything.
-        const bool fsWorkspace = fsc && fsc->hasFullscreen(w->m_workspace);
-        int        stack       = w->isFloating() ? 1 : 0;
-        if (fsWorkspace && fsc->isFullscreen(w))
-            stack = 2;
-        else if (fsWorkspace && stack == 1 && w->shouldRenderOverFullscreen())
-            stack = 3;
-        g.layer = windowPinned(w) ? 8 : (w->onSpecialWorkspace() ? 4 : 0) + stack;
+        const bool  region     = capturePos != Vector2D{};
+        g.corner               = fullscreen ? 0 : int(std::lround(w->presentation().rounding() * mon->m_scale * zoomScale(mon)));
+        g.round                = region ? 0 : g.corner;
+        g.roundingPower        = region || fullscreen ? 2.F : w->presentation().roundingPower();
+        g.layer                = windowStack(w);
         // Hyprland's opaque() ignores the layout alpha: a group tab or monocle window that
         // is fading out on a switch would still count as opaque and cut the cover below it
         g.opaque = fade >= 1.F && w->presentation().opaque();
@@ -589,22 +619,39 @@ namespace nsc {
             ++s.frames;
             s.seen = g_frameCount;
         }
-        // rebuild this monitor's covers, leave other monitors alone
-        std::erase_if(g_animBoxes, [&](const SAnimBox& a) { return a.mon.expired() || a.mon.lock() == mon; });
+        // Rebuild this session's covers on this monitor (see SAnimBox), drop those of sessions
+        // that don't capture it any more, leave the rest alone: a screenshot from a show_to
+        // client draws none of a stream's video covers, and the stream's video would freeze.
+        std::unordered_set<uint64_t> asked; // the covers on it the pump already asks about
+        for (const auto& a : g_animBoxes)
+            if (a.mon.lock() == mon)
+                asked.insert(a.cover);
+        std::erase_if(g_animBoxes, [&](const SAnimBox& a) { return a.mon.expired() || (a.mon.lock() == mon && (a.owner == g_fxStream || !capturedBy(mon, a.owner))); });
         NSC_TRACE("frame: monitor %s\n", mon->m_name.c_str());
 
         const auto capturePos = frame->m_session->m_captureBox.pos();
         const auto now        = std::chrono::steady_clock::now();
 
-        // Windows drawn on top of others: later in Hyprland's stacking (see windowGeo), then
-        // in list order.
+        // What is covered here, for the closing covers (trackClosed) and the hold. Kept for
+        // left out surfaces too: their fade-out on close and the hold.
+        std::unordered_set<uintptr_t> seen;
+        const auto                    remember = [&](uintptr_t key, SLastCover&& last) {
+            seen.insert(key);
+            if (!g_held.contains(key)) // a held cover keeps the time and rules it had
+                g_lastCovers[key] = std::move(last);
+        };
+
+        // Windows drawn on top of others: later in Hyprland's stacking (see windowStack), then
+        // in list order. The cover of a closing window goes among them where the window was
+        // when it closed, then where Hyprland draws its fade-out once that is found: after
+        // the windows of the same plane.
         // A cover is only drawn where its window is actually visible, so an opaque window
         // placed over a hidden one stays visible. Layers (bars) are left alone: they are
         // often translucent and we can't tell.
         struct SVisible {
-            PHLWINDOW                  w;
+            PHLWINDOW                  w; // none for a closing window's cover
             SWinGeo                    geo;
-            std::optional<SRuleValues> rules;        // set for hidden windows
+            std::optional<SRuleValues> rules;        // set for hidden windows and closing covers
             bool                       gone = false; // left out of the image, as if it wasn't there
         };
         std::vector<SVisible> visible;
@@ -616,8 +663,70 @@ namespace nsc {
             if (w->m_ruleApplicator && w->m_ruleApplicator->noScreenShare().valueOrDefault()) {
                 v.rules = ruleValuesFor(w);
                 v.gone  = left && transparentCover(*v.rules);
+                remember(reinterpret_cast<uintptr_t>(w.get()),
+                         SLastCover{
+                             .win           = w,
+                             .mon           = mon,
+                             .box           = CBox{g->pos, g->size},
+                             .rules         = *v.rules,
+                             .rounding      = w->presentation().rounding(),
+                             .roundingPower = w->presentation().roundingPower(),
+                             .stack         = g->layer,
+                             .at            = now,
+                         });
             }
         }
+
+        // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's black rect,
+        // no rounding. Drawn in the layer pass below.
+        struct SLayerCover {
+            PHLLS       l;
+            SRuleValues rules;
+            CBox        box;           // capture pixels
+            bool        done = false; // drawn (or left out) in the layer pass
+        };
+        std::unordered_map<uintptr_t, SLayerCover> layerCovers;
+        for (const auto& l : Desktop::layerState()->layers()) {
+            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !viewVisible(l) || l->m_monitor.lock() != mon)
+                continue;
+            const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            const auto box  = zoomed(mon, CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
+            if (box.w < 1 || box.h < 1)
+                continue;
+            const auto key   = reinterpret_cast<uintptr_t>(l.get());
+            auto       rules = ruleValuesFor(l);
+            remember(key,
+                     SLastCover{
+                         .layer   = l,
+                         .isLayer = true,
+                         .mon     = mon,
+                         .box     = CBox{pos, size},
+                         .rules   = rules,
+                         .stack   = int(l->m_layer),
+                         .at      = now,
+                     });
+            layerCovers.emplace(key, SLayerCover{.l = l, .rules = std::move(rules), .box = box});
+        }
+
+        // Surfaces shown as they are to this client (or held for the others only) are still
+        // covered for the other clients: keep their entries, and the time they were last
+        // covered, for the closing covers in the others' frames.
+        seen.insert(revealed.begin(), revealed.end());
+        trackClosed(mon, seen, now);
+        const auto closing = closingCovers(mon, capturePos, now, client, left);
+        for (const auto& c : closing) {
+            if (c.isLayer)
+                continue;
+            SWinGeo g;
+            g.box           = c.box;
+            g.area          = c.box;
+            g.round         = c.round;
+            g.roundingPower = c.roundingPower;
+            g.layer         = c.stack;
+            visible.push_back(SVisible{.geo = g, .rules = c.rules});
+        }
+
         // o is stacked above me
         const auto isAbove = [&](size_t o, size_t me) {
             const auto& a = visible[o].geo;
@@ -631,7 +740,7 @@ namespace nsc {
             // translucent window is drawn again on top of it (see below).
             for (size_t j = 0; j < visible.size(); ++j)
                 if (isAbove(j, i) && visible[j].geo.opaque && !visible[j].gone)
-                    subtractRounded(region, visible[j].geo.box, visible[j].geo.round);
+                    subtractRounded(region, visible[j].geo.box, visible[j].geo.corner);
             return region;
         };
         std::vector<std::pair<size_t, CRegion>> drawn; // covers (or black) drawn, per window
@@ -641,34 +750,25 @@ namespace nsc {
         std::iota(order.begin(), order.end(), size_t{0});
         std::ranges::stable_sort(order, {}, [&](size_t k) { return visible[k].geo.layer; });
 
-        std::unordered_set<uintptr_t> seen;
         for (const size_t i : order) {
-            if (!visible[i].rules)
+            if (!visible[i].rules || visible[i].gone)
                 continue;
-            const auto& w             = visible[i].w;
-            const auto& rules         = *visible[i].rules;
-            const auto& geo           = visible[i].geo;
-            const auto  pos           = geo.pos;
-            const auto  size          = geo.size;
-            const auto  box           = geo.box;
-            const int   round         = geo.round;
-            const auto  roundingPower = geo.roundingPower;
-
-            // kept for left out windows too: their fade-out on close and the hold
-            const auto key = reinterpret_cast<uintptr_t>(w.get());
-            seen.insert(key);
-            if (!g_held.contains(key)) // a held cover keeps the time and rules it had
-                g_lastCovers[key] = SLastCover{
-                .win           = w,
-                .mon           = mon,
-                .box           = CBox{pos.x, pos.y, size.x, size.y},
-                .rules         = rules,
-                .rounding      = w->presentation().rounding(),
-                .roundingPower = w->presentation().roundingPower(),
-                .at            = now,
-            };
-            if (visible[i].gone)
+            const auto& w     = visible[i].w;
+            const auto& rules = *visible[i].rules;
+            const auto& geo   = visible[i].geo;
+            if (!w) { // a closing window's cover
+                const CRegion clip = visibleRegion(i);
+                if (clip.empty())
+                    continue;
+                paintCover(ctx, image, "closing window", rules, geo.box, capturePos, geo.round, geo.roundingPower, clip);
+                drawn.emplace_back(i, clip);
                 continue;
+            }
+            const auto pos           = geo.pos;
+            const auto size          = geo.size;
+            const auto box           = geo.box;
+            const int  round         = geo.round;
+            const auto roundingPower = geo.roundingPower;
 
             const CRegion clip = visibleRegion(i);
             if (clip.empty()) {
@@ -695,19 +795,23 @@ namespace nsc {
                 cover = paintCover(ctx, image, what, rules, box, capturePos, round, roundingPower, clip);
             // media has the monitor repainted for its new frames (see pumpTick)
             if (cover)
-                g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}, cover});
+                g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}, cover, g_fxStream});
             drawn.emplace_back(i, clip);
         }
 
-        // Translucent windows above a hidden one, bottom to top: draw them again over the
-        // cover, so what shows through them (blurred, if they blur) is the cover and never
-        // the hidden window. Only over covers below them, minus whatever is above them.
+        // Windows above a hidden one, bottom to top: draw them again over the cover, only
+        // over covers below them, minus whatever is above them. A translucent window all
+        // over them, so what shows through it (blurred, if it blurs) is the cover and never
+        // the hidden window. An opaque one only in its rounded corners: a cover below it is
+        // cut along its box, corners left in (subtractRounded), and the rounding is drawn
+        // again here over the cover there (square in a region capture, see SWinGeo::corner:
+        // the corners then show the window, never what was below them).
         if (!drawn.empty()) {
             for (const size_t j : order) {
                 // Never redraw a hidden window from its real content. This also catches
                 // windows that are only translucent for a moment (fading in on open).
                 const auto& wj = visible[j].w;
-                if (visible[j].geo.opaque || !wj->m_ruleApplicator || wj->m_ruleApplicator->noScreenShare().valueOrDefault())
+                if (!wj || !wj->m_ruleApplicator || wj->m_ruleApplicator->noScreenShare().valueOrDefault())
                     continue;
                 CRegion region;
                 for (const auto& [i, clip] : drawn)
@@ -718,7 +822,7 @@ namespace nsc {
                 region.intersect(CRegion{visible[j].geo.area});
                 for (size_t k = 0; k < visible.size(); ++k)
                     if (isAbove(k, j) && visible[k].geo.opaque && !visible[k].gone)
-                        subtractRounded(region, visible[k].geo.box, visible[k].geo.round);
+                        subtractRounded(region, visible[k].geo.box, visible[k].geo.corner);
                 for (const auto& [i, clip] : drawn)
                     if (isAbove(i, j))
                         region.subtract(clip);
@@ -734,72 +838,70 @@ namespace nsc {
             }
         }
 
-
-        // Layers (layer-shell) with no_screen_share: same geometry as Hyprland's
-        // black rect, no rounding.
-        for (const auto& l : Desktop::layerState()->layers()) {
-            if (!l || !l->m_ruleApplicator || !l->m_ruleApplicator->noScreenShare().valueOrDefault() || !viewVisible(l) || l->m_monitor.lock() != mon)
-                continue;
-            const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-            const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-            const auto box  = zoomed(mon, CBox{pos.x, pos.y, std::max(size.x, 5.0), std::max(size.y, 5.0)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos);
-            if (box.w < 1 || box.h < 1)
-                continue;
-            const auto rules = ruleValuesFor(l);
-            const auto key   = reinterpret_cast<uintptr_t>(l.get());
-            seen.insert(key);
-            if (!g_held.contains(key)) // a held cover keeps the time and rules it had
-                g_lastCovers[key] = SLastCover{
-                .layer   = l,
-                .isLayer = true,
-                .mon     = mon,
-                .box     = CBox{pos.x, pos.y, size.x, size.y},
-                .rules   = rules,
-                .at      = now,
-            };
-            if (left && transparentCover(rules))
-                continue;
-            paintPopupBoxes(ctx, l, pos - l->m_geometry.pos(), mon, capturePos, image, coverKind(rules));
-            if (const auto cover = paintCover(ctx, image, "layer " + l->m_namespace, rules, box, capturePos, 0, 2.F))
-                g_animBoxes.push_back({mon, CBox{pos.x, pos.y, size.x, size.y}, cover});
-        }
-
-        // Surfaces shown as they are to this client are still hidden and on screen: keep
-        // their entries (and the time they were last covered) for the other clients, or a
-        // screenshot between two stream frames would drop the hold of a window that stops
-        // being hidden right after it.
-        seen.insert(revealed.begin(), revealed.end());
-        trackClosed(mon, seen, now);
-        CRegion coverArea = paintClosing(ctx, mon, capturePos, now, client, left, image);
-
-        // Layers above windows (bars, launchers, notifications) are drawn by Hyprland on
-        // top of the hidden window, and the covers went over them. Draw them again on top,
-        // only where a window cover was drawn, top then overlay. Hidden layers never.
+        // Layers in Hyprland's order: background and bottom, top and overlay, each in its own
+        // order, the fade-outs of a level after its layers. A hidden background or bottom
+        // layer is covered over its whole area, the windows on it included, the same as
+        // Hyprland's own black box. A top or overlay layer goes over everything below it:
+        // hidden, its cover does; otherwise it is drawn again over the covers below it, and
+        // a cover above it goes over it in turn. The popups of hidden layers get their boxes
+        // over all of it, as Hyprland draws them last.
+        CRegion coverArea; // every cover so far
         for (const auto& [i, clip] : drawn)
             coverArea.add(clip);
-        if (!coverArea.empty()) {
-            for (const uint32_t level : {2U, 3U}) {
-                for (const auto& l : Desktop::layerState()->layers()) {
-                    if (!l || l->m_layer != level || !viewVisible(l) || l->m_monitor.lock() != mon)
-                        continue;
-                    if (!l->m_ruleApplicator || l->m_ruleApplicator->noScreenShare().valueOrDefault())
-                        continue;
-                    const auto pos  = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-                    const auto size = l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-                    CRegion    region{zoomed(mon, CBox{pos, size}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos)};
-                    region.intersect(coverArea);
-                    if (region.empty())
-                        continue;
-                    NSC_TRACE("layer %s: redrawn over a cover\n", l->m_namespace.c_str());
-                    redrawLayer(ctx, l, region, mon, capturePos);
+        std::vector<PHLLS> popupsOf;
+        const auto         coverLayer = [&](SLayerCover& c) {
+            c.done = true;
+            if (left && transparentCover(c.rules))
+                return;
+            popupsOf.push_back(c.l);
+            const auto pos = c.l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+            if (const auto cover = paintCover(ctx, image, "layer " + c.l->m_namespace, c.rules, c.box, capturePos, 0, 2.F))
+                g_animBoxes.push_back({mon, CBox{pos, c.l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)}, cover, g_fxStream});
+            coverArea.add(c.box);
+        };
+        for (uint32_t level = 0; level < mon->m_layerSurfaceLayers.size(); ++level) {
+            for (const auto& ref : mon->m_layerSurfaceLayers[level]) {
+                const auto l = ref.lock();
+                if (!l || !l->m_ruleApplicator || !viewVisible(l) || l->m_monitor.lock() != mon)
+                    continue;
+                const auto pos = l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+                if (const auto it = layerCovers.find(reinterpret_cast<uintptr_t>(l.get())); it != layerCovers.end()) {
+                    coverLayer(it->second);
+                    continue;
                 }
+                if (level < 2 || l->m_ruleApplicator->noScreenShare().valueOrDefault() || coverArea.empty())
+                    continue;
+                // what is above windows (bars, launchers, notifications) and was covered
+                CRegion region{zoomed(mon, CBox{pos, l->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)}.translate(-mon->m_position).scale(mon->m_scale)).translate(-capturePos)};
+                region.intersect(coverArea);
+                if (region.empty())
+                    continue;
+                NSC_TRACE("layer %s: redrawn over a cover\n", l->m_namespace.c_str());
+                redrawLayer(ctx, l, region, mon, capturePos);
+            }
+            for (const auto& c : closing) {
+                if (!c.isLayer || c.stack != int(level))
+                    continue;
+                paintCover(ctx, image, "closing layer", c.rules, c.box, capturePos, c.round, c.roundingPower);
+                coverArea.add(c.box);
             }
         }
+        // not in the monitor's lists (Hyprland doesn't draw it then): on top, just in case
+        for (auto& c : layerCovers | std::views::values)
+            if (!c.done)
+                coverLayer(c);
+        for (const auto& l : popupsOf)
+            paintPopupBoxes(ctx, l, l->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - l->m_geometry.pos(), mon, capturePos, image,
+                            coverKind(layerCovers.at(reinterpret_cast<uintptr_t>(l.get())).rules));
 
-        paintExtraRects(ctx, mon, capturePos);
+        paintExtraRects(ctx, mon, capturePos, revealed);
         nsc_end_frame();
-        if (!g_animBoxes.empty() || !g_closing.empty())
-            startPump();
+        // a cover the pump hasn't asked about yet: soon, it may be a video still loading
+        const bool fresh = std::ranges::any_of(g_animBoxes, [&](const SAnimBox& a) { return !asked.contains(a.cover) && a.mon.lock() == mon; });
+        // a hold to end (see holdUnhidden), which may have started with nothing captured
+        const bool holding = std::ranges::any_of(g_hidden, [](const auto& kv) { return kv.second.since.has_value(); });
+        if (!g_animBoxes.empty() || !g_closing.empty() || holding)
+            startPump(fresh);
         pruneTextures();
         drainNotifications();
     }

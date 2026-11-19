@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # `hyprctl clients` and `hyprctl activewindow` show what the plugin does to each window
 # (noScreenShare, noScreenShareCover), in both formats, and are Hyprland's own again once
-# the plugin is unloaded.
+# the plugin is unloaded. With another plugin that wraps `clients` too, before or after
+# this one, unloading either first neither crashes nor leaves a wrapper of an unloaded
+# plugin to be called or destroyed.
 #
 #   tests/e2e/hyprctl.sh <libnoshare-cover.so>
 #
-# Requires: Hyprland, foot, jq, imagemagick; a seat. Exit code 0 means all passed.
+# Requires: Hyprland, foot, jq, imagemagick, c++ and pkg-config with Hyprland's headers (the
+# other plugin is built at runtime); a seat. Exit code 0 means all passed.
 set -uo pipefail
 
 PLUGIN=$(realpath "${1:?path to libnoshare-cover.so}")
@@ -86,6 +89,140 @@ same "fields in clients" "$(hctl clients | grep -c noScreenShare)" 0
 same "fields in clients -j" "$(hctl clients -j | jq '[.[] | select(has("noScreenShare"))] | length')" 0
 hctl plugin load "$PLUGIN" >/dev/null; sleep 1
 same "loaded again: fields once per window" "$(hctl clients | grep -c 'noScreenShare: ')" 6
+
+echo "== another plugin wrapping clients"
+# It puts a lambda of its own in place of the handler it finds (a line before the answer),
+# and puts that handler back on unload. Built like this plugin (-fno-gnu-unique), so its
+# code is really gone once it is unloaded. Two of them:
+#   blind:   the common way, it keeps a copy of what it found and puts it back whatever is
+#            there by then;
+#   careful: the way this plugin does it, only its wrapper holds what it found, put back
+#            only while a wrapper of its own is still held.
+cat > "$WORK/other.cpp" <<'CPP'
+#include "helpers/defer/Promise.hpp"
+#include "helpers/memory/Memory.hpp"
+#define private public
+#include "ipc/s1/S1.hpp"
+#undef private
+#include "plugins/PluginAPI.hpp"
+
+namespace {
+    using Handler = std::function<IPC::Socket1::SResponse(const IPC::Socket1::SRequest&)>;
+    SP<IPC::Socket1::SCommand> g_cmd;
+#ifdef BLIND
+    Handler g_found;
+#else
+    std::weak_ptr<const Handler> g_found;
+#endif
+}
+
+APICALL EXPORT std::string PLUGIN_API_VERSION() {
+    return HYPRLAND_API_VERSION;
+}
+
+APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE) {
+    for (const auto& cmd : IPC::Socket1::sock()->m_commands) {
+        if (!cmd || cmd->name != "clients" || cmd->match != IPC::Socket1::COMMAND_MATCH_EXACT)
+            continue;
+        auto found = std::make_shared<const Handler>(cmd->handler);
+        g_cmd      = cmd;
+#ifdef BLIND
+        g_found = *found;
+#else
+        g_found = found;
+#endif
+        cmd->handler = [found](const IPC::Socket1::SRequest& request) {
+            auto response = (*found)(request);
+            if (auto* text = std::get_if<std::string>(&response.result); text && request.format == IPC::Socket1::FORMAT_NORMAL)
+                *text = "wrapped-by-other\n" + *text;
+            return response;
+        };
+    }
+    return {"ctl-other", "wraps hyprctl clients", "test", "1"};
+}
+
+APICALL EXPORT void PLUGIN_EXIT() {
+#ifdef BLIND
+    if (g_cmd)
+        g_cmd->handler = std::move(g_found);
+#else
+    if (const auto found = g_found.lock(); g_cmd && found)
+        g_cmd->handler = *found;
+#endif
+    g_cmd.reset();
+}
+CPP
+BLIND=$WORK/libctl-blind.so
+CAREFUL=$WORK/libctl-careful.so
+build_other() { # $1: output, $2...: extra flags
+    c++ -std=c++26 -shared -fPIC -fno-gnu-unique -O2 "${@:2}" \
+        $(pkg-config --cflags hyprland pixman-1 libdrm wayland-server egl hyprutils hyprgraphics aquamarine hyprlang) \
+        -o "$1" "$WORK/other.cpp" 2> "$WORK/other.log" || { fail "can't build $1"; tail -5 "$WORK/other.log"; }
+}
+build_other "$BLIND" -DBLIND
+build_other "$CAREFUL"
+
+load() { hctl plugin load "$1" >/dev/null; sleep 1; }
+unload() { hctl plugin unload "$1" >/dev/null; sleep 1; }
+# Hyprland still runs and answers with every window
+alive() { hctl clients -j 2>/dev/null | jq -e 'length == 6' >/dev/null 2>&1; }
+marks() { hctl clients | grep -c '^wrapped-by-other$'; }
+fields() { hctl clients | grep -c 'noScreenShare: '; }
+
+if [ -f "$BLIND" ] && [ -f "$CAREFUL" ]; then
+    unload "$PLUGIN"
+
+    echo "-- blind, loaded before the plugin and unloaded before it"
+    load "$BLIND"
+    load "$PLUGIN"
+    same "both answer: its line" "$(marks)" 1
+    same "both answer: the fields" "$(fields)" 6
+    # it puts back Hyprland's handler, and our wrapper (holding its own) goes
+    unload "$BLIND"
+    alive && pass "it unloaded first" || fail "Hyprland died as the other plugin unloaded"
+    same "its line is gone" "$(marks)" 0
+    same "the fields went with it" "$(fields)" 0
+    # nothing of its code is left here to call or destroy
+    unload "$PLUGIN"
+    alive && pass "the plugin unloaded after it: Hyprland lives" || fail "Hyprland died as the plugin unloaded after the other one"
+    alive && same "clients is Hyprland's own" "$(marks)/$(fields)" 0/0
+
+    echo "-- blind, loaded before the plugin and unloaded after it"
+    load "$BLIND"
+    load "$PLUGIN"
+    unload "$PLUGIN"
+    alive && pass "the plugin unloaded first: Hyprland lives" || fail "Hyprland died as the plugin unloaded before the other one"
+    alive && same "its line stays, the fields are gone" "$(marks)/$(fields)" 1/0
+    unload "$BLIND"
+    alive && pass "it unloaded after: Hyprland lives" || fail "Hyprland died as the other plugin unloaded after"
+    alive && same "clients is Hyprland's own" "$(marks)/$(fields)" 0/0
+
+    # Wrapped around the plugin's wrapper, the other one goes with it when the plugin
+    # unloads first: nothing can be taken out of the middle of the chain, and kept, it would
+    # call into the unloaded plugin. (A blind one would then put back the plugin's wrapper
+    # on its own unload, code of an unloaded plugin: that one is not tried.)
+    echo "-- careful, loaded after the plugin and unloaded after it"
+    load "$PLUGIN"
+    load "$CAREFUL"
+    same "both answer: its line" "$(marks)" 1
+    same "both answer: the fields" "$(fields)" 6
+    unload "$PLUGIN"
+    alive && pass "the plugin unloaded first: Hyprland lives" || fail "Hyprland died as the plugin unloaded under the other one"
+    alive && same "both wrappers are gone" "$(marks)/$(fields)" 0/0
+    unload "$CAREFUL"
+    alive && pass "it unloaded after: Hyprland lives" || fail "Hyprland died as the other plugin unloaded after"
+    alive && same "clients is Hyprland's own" "$(marks)/$(fields)" 0/0
+
+    echo "-- careful, loaded after the plugin and unloaded before it"
+    load "$PLUGIN"
+    load "$CAREFUL"
+    unload "$CAREFUL"
+    alive && pass "it unloaded first: Hyprland lives" || fail "Hyprland died as the other plugin unloaded over the plugin"
+    alive && same "its line is gone, the fields stay" "$(marks)/$(fields)" 0/6
+    unload "$PLUGIN"
+    alive && pass "the plugin unloaded after it: Hyprland lives" || fail "Hyprland died as the plugin unloaded after the other one"
+    alive && same "clients is Hyprland's own" "$(marks)/$(fields)" 0/0
+fi
 
 pkill -xu "$(id -u)" Hyprland
 echo

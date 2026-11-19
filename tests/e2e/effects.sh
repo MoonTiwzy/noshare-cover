@@ -97,6 +97,22 @@ check_effect pixelate 32
 echo "== blur"
 check_effect blur 24
 
+# Under cursor zoom the window's box is up to ten times the screen. Pixelate 2 halves it only
+# once: for a window as wide as the screen that was a buffer of five screens, past the GPU's
+# texture limit on a 3840 px wide monitor (19200 > 16384), and Hyprland went down on it. On a
+# smaller monitor this only checks that the effect still works there.
+echo "== pixelate 2 under cursor zoom 10"
+start "pixelate 2" mosaic 10
+kill "$(hctl clients -j | jq -r '.[] | select(.class == "plain") | .pid')" # fx-me takes the whole screen
+sleep 1
+shot zoom-fx
+if hctl version >/dev/null 2>&1; then
+    pass "Hyprland is still there after a pixelate cover under zoom 10"
+    grep -aq "window fx-me: pixelate 2" "$WORK/trace.log" && pass "the pixelate cover was drawn under zoom 10" || fail "no pixelate cover under zoom 10 in the trace"
+else
+    fail "Hyprland went down drawing a pixelate cover under zoom 10 ($WORK/hypr.log)"
+fi
+
 # The cursor over a cover must be where and as Hyprland draws it: compared with a capture
 # that shows the window as it is (the cursor doesn't move in between, so neither does zoom).
 check_cursor() { # $1: cursor zoom

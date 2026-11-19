@@ -26,7 +26,8 @@
  * and accounts for the capture region itself. Rects persist until replaced.
  *
  * Why bind via dl_iterate_phdr: Hyprland loads plugins with RTLD_LOCAL, so
- * dlsym(RTLD_DEFAULT, ...) can't see their symbols.
+ * dlsym(RTLD_DEFAULT, ...) can't see their symbols. From C, define _GNU_SOURCE before
+ * any system header (C++ compilers define it already).
  */
 #ifndef NOSHARE_COVER_API_H
 #define NOSHARE_COVER_API_H
@@ -80,11 +81,22 @@ typedef struct {
 #include <link.h>
 #include <string.h>
 
+/* The skip-th loaded object with "noshare-cover" in its path. */
+typedef struct {
+    const char* path;
+    size_t      skip;
+} noshare_cover__search;
+
 static int noshare_cover__find(struct dl_phdr_info* info, size_t size, void* data) {
+    noshare_cover__search* search = (noshare_cover__search*)data;
     (void)size;
     if (!info->dlpi_name || !strstr(info->dlpi_name, "noshare-cover"))
         return 0;
-    *(const char**)data = info->dlpi_name;
+    if (search->skip) {
+        search->skip--;
+        return 0;
+    }
+    search->path = info->dlpi_name;
     return 1;
 }
 
@@ -92,18 +104,32 @@ static int noshare_cover__find(struct dl_phdr_info* info, size_t size, void* dat
  * Find the loaded noshare-cover and bind its functions.
  * 0: ok (v2 available); 1: plugin not loaded; 2: old version without v2
  * (v1 functions are still filled in if present); 3: dlopen failed.
+ *
+ * Every loaded object with "noshare-cover" in its path is a candidate (another plugin built
+ * in a directory of that name, say); the first one that exports the API is taken.
  */
 static inline int noshare_cover_bind(noshare_cover_api* api) {
+    void*  h      = NULL;
+    int    failed = 0;
+    size_t skip;
+
     memset(api, 0, sizeof *api);
 
-    const char* path = NULL;
-    dl_iterate_phdr(noshare_cover__find, &path);
-    if (!path)
-        return 1;
-
-    void* h = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
-    if (!h)
-        return 3;
+    for (skip = 0;; ++skip) {
+        noshare_cover__search search = {NULL, skip};
+        dl_iterate_phdr(noshare_cover__find, &search);
+        if (!search.path)
+            return failed ? 3 : 1;
+        h = dlopen(search.path, RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) {
+            failed = 1;
+            continue;
+        }
+        /* every version exports add_extra_rect (v1), v2 on api_version too */
+        if (dlsym(h, "noshare_cover_add_extra_rect") || dlsym(h, "noshare_cover_api_version"))
+            break;
+        dlclose(h);
+    }
     api->handle = h;
 
 #define NOSHARE_COVER__SYM(field, name) *(void**)(&api->field) = dlsym(h, name)

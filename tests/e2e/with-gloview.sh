@@ -67,6 +67,13 @@ sleep 1.5
 f1=$(magenta_share)
 hctl gloview >/dev/null 2>&1; sleep 1.2
 awk "BEGIN{exit !($f1 > 0.005)}" && pass "preview shows the cover in the capture (magenta share $f1)" || fail "no cover on the overlay preview (share $f1)"
+# a client in show_to sees the hidden window as it is, and its preview too
+hctl eval 'hl.config({ plugin = { no_screen_share_cover = { show_to = "grim" } } })' >/dev/null
+hctl gloview >/dev/null 2>&1; sleep 1.5
+f2=$(magenta_share)
+hctl gloview >/dev/null 2>&1; sleep 1.2
+hctl eval 'hl.config({ plugin = { no_screen_share_cover = { show_to = "" } } })' >/dev/null
+awk "BEGIN{exit !($f2 < 0.001)}" && pass "show_to = grim: the preview shows the window, not the cover (magenta share $f2)" || fail "show_to = grim: the preview is still covered for grim (share $f2)"
 grep -q "Path C" $W/hypr.log "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log 2>/dev/null; true
 
 echo "== 5. noshare-cover first, gloview second"

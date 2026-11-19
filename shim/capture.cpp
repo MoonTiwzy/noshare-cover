@@ -100,10 +100,15 @@ namespace nsc {
             std::chrono::steady_clock::time_point at;
         };
 
+        // Emptied on every config reload (forgetCaptureClients); between reloads the lists can
+        // still change (hyprctl eval), hence the limit.
         std::unordered_map<std::string, SResolvedPath> g_resolvedPaths;
+        constexpr size_t                               MAX_RESOLVED_PATHS = 64;
 
         const std::string& resolvedPath(std::string_view entry) {
-            const auto now       = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (g_resolvedPaths.size() >= MAX_RESOLVED_PATHS && !g_resolvedPaths.contains(std::string(entry)))
+                g_resolvedPaths.clear();
             auto [it, inserted] = g_resolvedPaths.try_emplace(std::string(entry));
             if (inserted || now - it->second.at >= std::chrono::seconds(1)) {
                 std::string raw(entry);
@@ -147,8 +152,17 @@ namespace nsc {
             return list.find_first_not_of(", \t") != std::string::npos;
         }
 
-        // comm names already told about (see sees)
+        // comm names already told about (see sees); told again after a config reload
         std::unordered_set<std::string> g_commWarned;
+
+        // A function's own symbol, by its qualified name: not one whose name only starts the
+        // same (CScreenshareFrame::renderMonitorRegion), nor a lambda or anything else local to
+        // it ("...renderMonitor(Render::CRenderContext&)::{lambda()#1}::operator()() const").
+        // The parameter list itself is left out: nm and llvm-nm may spell it differently.
+        bool isFunction(std::string_view demangled, std::string_view name) {
+            const auto at = demangled.find(std::string(name) + "(");
+            return at != std::string_view::npos && demangled.find(")::", at) == std::string_view::npos;
+        }
 
         // The surfaces this client may see get no_screen_share switched off for the cover
         // pass as well, so paintCovers treats them as normal windows: no cover, occlusion
@@ -179,38 +193,47 @@ namespace nsc {
         // A surface that stops being hidden while it's still on screen keeps its last cover for
         // the same close_hold / no_screen_share_cover_hold as a closing one: a browser changes
         // the window title before it repaints, so with a rule that matches the title the old
-        // page would reach the stream for a frame or two when you switch away. Surfaces this
-        // client may see (show_to / hide_from) are not held, with the rules they had while hidden.
-        std::vector<SSuppressed> holdUnhidden(const std::unordered_set<uintptr_t>& revealed, const SCaptureClient& client) {
+        // page would reach the stream for a frame or two when you switch away. The hold counts
+        // from the moment it stopped being hidden (see SHidden), with the rules it had then.
+        // Surfaces this client may see with those rules (show_to / hide_from) are not held for
+        // it; they join revealed, as they are still covered for the other clients.
+        std::vector<SSuppressed> holdUnhidden(std::unordered_set<uintptr_t>& revealed, const SCaptureClient& client) {
             std::vector<SSuppressed> out;
             const auto               now  = std::chrono::steady_clock::now();
-            const auto               keep = [&](uintptr_t key, Desktop::Types::COverridableVar<bool>& var) {
-                if (var.valueOrDefault() || revealed.contains(key))
+            const auto               keep = [&](const auto& view, Desktop::Types::COverridableVar<bool>& var) {
+                const auto key = reinterpret_cast<uintptr_t>(view.get());
+                if (revealed.contains(key))
+                    return; // hidden, and this client sees it as it is
+                const bool hidden = var.valueOrDefault();
+                const auto h      = trackHidden(view, hidden, now);
+                if (hidden || !h || !h->since || now - *h->since >= holdFor(h->rules))
                     return;
-                const auto it = g_lastCovers.find(key);
-                if (it == g_lastCovers.end() || now - it->second.at >= holdFor(it->second.rules) || client.sees(it->second.rules))
+                if (client.sees(h->rules)) {
+                    revealed.insert(key);
                     return;
+                }
                 std::optional<bool> prev;
                 if (var.hasValue() && var.getPriority() == Desktop::Types::PRIORITY_SET_PROP)
                     prev = var.value();
                 var.set(true, Desktop::Types::PRIORITY_SET_PROP);
                 out.push_back({&var, prev});
                 g_held.insert(key);
-                g_heldRules[key] = it->second.rules;
+                g_heldRules[key] = h->rules;
             };
             for (const auto& w : Desktop::windowState()->windows())
                 if (w && w->m_ruleApplicator && w->mapped())
-                    keep(reinterpret_cast<uintptr_t>(w.get()), w->m_ruleApplicator->noScreenShare());
+                    keep(w, w->m_ruleApplicator->noScreenShare());
             for (const auto& l : Desktop::layerState()->layers())
                 if (l && l->m_ruleApplicator && viewVisible(l))
-                    keep(reinterpret_cast<uintptr_t>(l.get()), l->m_ruleApplicator->noScreenShare());
+                    keep(l, l->m_ruleApplicator->noScreenShare());
             if (!out.empty())
                 NSC_TRACE("holding the cover of %zu surface(s) that just stopped being hidden\n", out.size());
             return out;
         }
 
         // original: Hyprland's renderMonitor for this frame
-        // revealedKeys: hidden surfaces this client sees as they are (see revealFor)
+        // revealedKeys: hidden surfaces this client sees as they are (see revealFor), and those
+        // held for the other clients only (see holdUnhidden)
         template <class F>
         void renderMonitorWithCovers(Screenshare::CScreenshareFrame* self, Render::CRenderContext& ctx, const F& original, const SCaptureClient& client,
                                      const std::unordered_set<uintptr_t>& revealedKeys) {
@@ -249,12 +272,15 @@ namespace nsc {
         //
         // The copy is a whole frame more to draw, and the only thing that blurs what is under it
         // is a translucent window redrawn over a cover (redrawWindow). So the detour is taken
-        // only for a frame that can have one: with a hidden window on the monitor and a
-        // translucent one that isn't hidden. Any other frame goes straight into the client's buffer.
+        // only for a frame that can have one: with a hidden or closing window on the monitor and
+        // a translucent one that isn't hidden. Any other frame goes straight into the client's
+        // buffer.
         SP<Render::IFramebuffer> g_offscreen;
 
         bool mayBlurOverCover(const PHLMONITOR& mon, const Vector2D& capturePos) {
-            bool hidden = false, translucent = false;
+            const auto now    = std::chrono::steady_clock::now();
+            bool       hidden = std::ranges::any_of(g_closing, [&](const SClosing& c) { return !c.isLayer && c.mon.lock() == mon && (!c.holdUntil || now < *c.holdUntil); });
+            bool       translucent = false;
             for (const auto& w : Desktop::windowState()->windows()) {
                 if (!w || !w->m_ruleApplicator)
                     continue;
@@ -340,6 +366,21 @@ namespace nsc {
             g_hookRetry.reset();
         }
 
+        // Whether a session that passes pred captures mon right now (see beingCaptured).
+        template <class P>
+        bool captured(const PHLMONITOR& mon, const P& pred) {
+            const auto& mgr = Screenshare::mgr();
+            if (!mon || !mgr)
+                return false;
+            const auto ofMonitor = [&](const Screenshare::CScreenshareSession* s) {
+                return s && !s->m_stopped && (s->m_type == Screenshare::SHARE_MONITOR || s->m_type == Screenshare::SHARE_REGION) && s->m_monitor == mon && pred(s);
+            };
+            // sessions and frames are owned by unique pointers: their weak pointers are only
+            // checked and read, never locked (hyprutils asserts)
+            return std::ranges::any_of(mgr->m_sessions, [&](const auto& s) { return !s.expired() && s->m_sharing && ofMonitor(s.get()); }) ||
+                std::ranges::any_of(mgr->m_pendingFrames, [&](const auto& f) { return !f.expired() && !f->done() && !f->m_session.expired() && ofMonitor(f->m_session.get()); });
+        }
+
     } // namespace
 
     // Unzoomed monitor pixel box -> where it ends up in the screencast image.
@@ -395,16 +436,13 @@ namespace nsc {
     // the first portal stream it stayed true until logout, and animated covers on screen got
     // the monitor repainted 60 times a second with nothing capturing it.
     bool beingCaptured(const PHLMONITOR& mon) {
-        const auto& mgr = Screenshare::mgr();
-        if (!mon || !mgr)
-            return false;
-        const auto ofMonitor = [&](const Screenshare::CScreenshareSession* s) {
-            return s && !s->m_stopped && (s->m_type == Screenshare::SHARE_MONITOR || s->m_type == Screenshare::SHARE_REGION) && s->m_monitor == mon;
-        };
-        // sessions and frames are owned by unique pointers: their weak pointers are only
-        // checked and read, never locked (hyprutils asserts)
-        return std::ranges::any_of(mgr->m_sessions, [&](const auto& s) { return !s.expired() && s->m_sharing && ofMonitor(s.get()); }) ||
-            std::ranges::any_of(mgr->m_pendingFrames, [&](const auto& f) { return !f.expired() && !f->done() && !f->m_session.expired() && ofMonitor(f->m_session.get()); });
+        return captured(mon, [](const Screenshare::CScreenshareSession*) { return true; });
+    }
+
+    // The same for one session. Only its address is compared: a session that is gone isn't
+    // found among the live ones, and is never touched.
+    bool capturedBy(const PHLMONITOR& mon, uintptr_t session) {
+        return session && captured(mon, [&](const Screenshare::CScreenshareSession* s) { return reinterpret_cast<uintptr_t>(s) == session; });
     }
 
     // Hidden windows are hidden from every capture by default. show_to lets chosen
@@ -441,7 +479,7 @@ namespace nsc {
     void installHooks() {
         void* target = nullptr;
         for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, "renderMonitor")) {
-            if (match.demangled.find("CScreenshareFrame::renderMonitor") != std::string::npos) {
+            if (isFunction(match.demangled, "CScreenshareFrame::renderMonitor")) {
                 target = match.address;
                 break;
             }
@@ -451,7 +489,7 @@ namespace nsc {
 
         // Optional: without it covers just don't follow cursor zoom.
         for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, "applyZoomTransform")) {
-            if (match.demangled.find("CMonitorZoomController::applyZoomTransform") == std::string::npos)
+            if (!isFunction(match.demangled, "CMonitorZoomController::applyZoomTransform"))
                 continue;
             g_zoomHook = HyprlandAPI::createFunctionHook(g_handle, match.address, reinterpret_cast<void*>(&hkApplyZoom));
             if (g_zoomHook && !g_zoomHook->hook()) {
@@ -496,6 +534,12 @@ namespace nsc {
         }
         g_zoom.clear();
         g_offscreen.reset();
+        forgetCaptureClients();
+    }
+
+    void forgetCaptureClients() {
+        g_resolvedPaths.clear();
+        g_commWarned.clear();
     }
 
     std::optional<CBox> zoomBox(const PHLMONITOR& mon) {

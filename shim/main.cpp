@@ -66,17 +66,28 @@ namespace nsc {
 
             g_onWindowClose = Event::bus()->m_events.window.close.listen([](PHLWINDOW w) { onWindowClose(w); });
             g_onLayerClose  = Event::bus()->m_events.layer.closed.listen([](PHLLS l) { onLayerClose(l); });
-            g_onWindowOpen  = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { prewarmWindow(w); });
-            g_onWindowRules = Event::bus()->m_events.window.updateRules.listen([](PHLWINDOW w) { prewarmWindow(w); });
-            g_onLayerOpen   = Event::bus()->m_events.layer.opened.listen([](PHLLS l) { prewarmLayer(l); });
-            g_onLayerRules  = Event::bus()->m_events.layer.updateRules.listen([](PHLLS l) { prewarmLayer(l); });
+            // rules (re)applied: warm up the cover, and note whether it is hidden (for the hold
+            // once it stops being hidden, see trackHidden)
+            const auto onWindow = [](PHLWINDOW w) {
+                prewarmWindow(w);
+                trackHidden(w);
+            };
+            const auto onLayer = [](PHLLS l) {
+                prewarmLayer(l);
+                trackHidden(l);
+            };
+            g_onWindowOpen  = Event::bus()->m_events.window.open.listen(onWindow);
+            g_onWindowRules = Event::bus()->m_events.window.updateRules.listen(onWindow);
+            g_onLayerOpen   = Event::bus()->m_events.layer.opened.listen(onLayer);
+            g_onLayerRules  = Event::bus()->m_events.layer.updateRules.listen(onLayer);
             // windows already open when the plugin loads (hyprpm reload, config reload)
             for (const auto& w : Desktop::windowState()->windows())
-                prewarmWindow(w);
+                onWindow(w);
             for (const auto& l : Desktop::layerState()->layers())
-                prewarmLayer(l);
+                onLayer(l);
 
             g_onReload = Event::bus()->m_events.config.reloaded.listen([] {
+                forgetCaptureClients();
                 pushSettings();
                 drainNotifications();
             });

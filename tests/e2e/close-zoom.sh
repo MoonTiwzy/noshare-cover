@@ -118,6 +118,10 @@ echo "== closing window"
 close_case "during the close animation" 0 30 0.5 1
 close_case "close_hold keeps it" 1500 1 0.8 1
 close_case "close_hold ends" 1500 1 2.8 0
+# a 1 s close animation, then 1 s of hold: Hyprland drops the finished fade-out at once, and
+# the hold used to count from 150 ms after the close then (over at 1.15 s)
+close_case "close_hold after a long animation keeps it" 1000 10 1.6 1
+close_case "close_hold after a long animation ends" 1000 10 3.2 0
 close_case "closed after a static screen" 0 30 0.5 1 quiet
 close_case "hold without animation, static stream" 3000 0 1.2 1 static
 

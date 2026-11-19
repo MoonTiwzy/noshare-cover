@@ -170,10 +170,15 @@ namespace nsc {
     // A stream waiting for its next frame counts as capturing (see beingCaptured),
     // not only a recent frame: otherwise a pause in frames would stop the pump and
     // nothing could wake it up again.
+    // A box belongs to the capture session whose frame drew it, and stays until that
+    // session's next frame on the monitor or until it stops capturing: a client that
+    // sees the surface as it is (show_to) draws no cover there, so its frames neither
+    // need the box nor may drop it for a stream that still shows the cover.
     struct SAnimBox {
         PHLMONITORREF mon;
-        CBox          box;   // global logical coordinates
-        uint64_t      cover; // the core's id of the media drawn there
+        CBox          box;       // global logical coordinates
+        uint64_t      cover;     // the core's id of the media drawn there
+        uintptr_t     owner = 0; // the capture session it was drawn for (an address, only compared)
     };
 
     // What stands in for a hidden surface: no_screen_share_cover (or path_cover) is media, or
@@ -243,7 +248,8 @@ namespace nsc {
         SRuleValues                           rules;
         float                                 rounding      = 0.F;
         float                                 roundingPower = 2.F;
-        std::chrono::steady_clock::time_point at; // frame it was last covered in
+        int                                   stack         = 0; // see SClosing
+        std::chrono::steady_clock::time_point at;                // frame it was last covered in
     };
 
     struct SClosing {
@@ -253,9 +259,38 @@ namespace nsc {
         SRuleValues                                          rules;
         float                                                rounding      = 0.F;
         float                                                roundingPower = 2.F;
+        bool                                                 held          = false; // closed during its hold, see SHidden
+        // where its cover goes among the others: for a layer its layer (background..overlay),
+        // for a window where it was stacked when it closed (as SWinGeo::layer counts it, see
+        // windowStack), then where its fade-out is drawn once that is found
+        int                                                  stack = 0;
         WP<Desktop::IFadeout>                                fade;
-        std::chrono::steady_clock::time_point                bindUntil; // give up looking for the fade-out after this
+        bool                                                 bound = false; // its fade-out was found (and may be gone since: then it ended)
+        std::chrono::steady_clock::time_point                bindUntil;     // give up looking for the fade-out after this
         std::optional<std::chrono::steady_clock::time_point> holdUntil; // set once the fade-out is over
+    };
+
+    // A hidden window or layer, as Hyprland's rules last had it: told by window.updateRules
+    // and layer.updateRules (a rule that matches the title stops matching), or by a capture
+    // frame that finds it changed (hyprctl setprop tells nobody). For the hold once it stops
+    // being hidden (see holdUnhidden), counted from that moment, not from the last capture
+    // frame that covered it: on a still screen that can be long before.
+    struct SHidden {
+        PHLWINDOWREF                                         win;   // set for windows
+        PHLLSREF                                             layer; // set for layers
+        SRuleValues                                          rules; // as they were while it was hidden: the rule that hid it may set the hold
+        std::optional<std::chrono::steady_clock::time_point> since; // not hidden since then
+        bool                                                 repainted = false; // the hold is over and its monitor was repainted once
+    };
+
+    // A closing cover to draw in this frame (see closingCovers).
+    struct SClosingCover {
+        SRuleValues rules;
+        CBox        box; // capture pixels
+        int         round         = 0;
+        float       roundingPower = 2.F;
+        bool        isLayer       = false;
+        int         stack         = 0; // see SClosing
     };
 
     // Who a capture client is: its executable, or only the name from /proc/<pid>/comm
@@ -280,9 +315,13 @@ namespace nsc {
     struct SWinGeo {
         Vector2D pos, size; // global logical, pos includes the workspace render offset
         CBox     box;       // capture pixels
-        int      round         = 0;
+        int      round         = 0; // the rounding its cover or its redraw gets in this capture
+        // the rounding it has in the capture image, where it hides what is below it: the same,
+        // but a region capture copies the monitor's rounded picture while nothing drawn into
+        // it is rounded (Hyprland skips that too for its own boxes there)
+        int      corner        = 0;
         float    roundingPower = 2.F;
-        int      layer         = 0; // stacking, see windowGeo
+        int      layer         = 0; // stacking, see windowStack
         bool     opaque        = false;
         // Hyprland bends the window while it moves (decoration:wobble): it isn't in its box
         // then, but somewhere within area (capture pixels, the box otherwise)
@@ -352,7 +391,9 @@ namespace nsc {
     // capture.cpp
     void                installHooks();
     void                removeHooks();
+    void                forgetCaptureClients(); // what was found out about the show_to / hide_from lists (config reload)
     bool beingCaptured(const PHLMONITOR& mon);
+    bool capturedBy(const PHLMONITOR& mon, uintptr_t session); // by that session (its address, see SAnimBox::owner)
     CBox zoomed(const PHLMONITOR& mon, const CBox& b);
     double zoomScale(const PHLMONITOR& mon);
     std::optional<CBox> zoomBox(const PHLMONITOR& mon); // the zoomed monitor image, if zoomed
@@ -366,6 +407,7 @@ namespace nsc {
 
     // paint.cpp
     extern CRegion g_painted;
+    int windowStack(const PHLWINDOW& w);
     std::optional<SWinGeo> windowGeo(const PHLWINDOW& w, const PHLMONITOR& mon, const Vector2D& capturePos);
     uint64_t paintCover(Render::CRenderContext& ctx, const SP<Render::ITexture>& image, const std::string& what, const SRuleValues& rules, const CBox& box, const Vector2D& capturePos,
                         int round, float roundingPower, const CRegion& clip = {});
@@ -378,15 +420,25 @@ namespace nsc {
     extern std::unordered_map<uintptr_t, SLastCover>  g_lastCovers;
     extern std::unordered_set<uintptr_t>              g_held;
     extern std::unordered_map<uintptr_t, SRuleValues> g_heldRules;
+    extern std::unordered_map<uintptr_t, SHidden>     g_hidden;
     extern std::vector<SClosing>                      g_closing;
     void trackClosed(const PHLMONITOR& mon, const std::unordered_set<uintptr_t>& seen, std::chrono::steady_clock::time_point now);
-    CRegion paintClosing(Render::CRenderContext& ctx, const PHLMONITOR& mon, const Vector2D& capturePos, std::chrono::steady_clock::time_point now, const SCaptureClient& client,
-                         bool left, const SP<Render::ITexture>& image);
-    void startPump();
+    std::vector<SClosingCover> closingCovers(const PHLMONITOR& mon, const Vector2D& capturePos, std::chrono::steady_clock::time_point now, const SCaptureClient& client,
+                                             bool left);
+    // Keeps the pump going. soon: something new is up (a closing cover, a cover the pump hasn't
+    // asked about yet), so it ticks within PUMP_EVERY even when it sleeps longer (up to
+    // PUMP_LONGEST_MS while it only has stills to look at); otherwise it is only woken if idle.
+    void startPump(bool soon = true);
     void onWindowClose(const PHLWINDOW& w);
     void onLayerClose(const PHLLS& l);
     void prewarmWindow(const PHLWINDOW& w);
     void prewarmLayer(const PHLLS& l);
+    // Whether it is hidden now, from its rules (open, updateRules, plugin load)...
+    void trackHidden(const PHLWINDOW& w);
+    void trackHidden(const PHLLS& l);
+    // ...or as a capture frame finds it. Its entry, if it has one.
+    SHidden* trackHidden(const PHLWINDOW& w, bool hidden, std::chrono::steady_clock::time_point now);
+    SHidden* trackHidden(const PHLLS& l, bool hidden, std::chrono::steady_clock::time_point now);
     void releaseClosing();
 
     // hyprctl.cpp
