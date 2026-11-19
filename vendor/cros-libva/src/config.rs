@@ -74,17 +74,18 @@ impl Config {
         // Safe because `self` represents a valid VAConfig. We first query how
         // much space is needed by the C API by passing in NULL in the first
         // call to `vaQuerySurfaceAttributes`.
-        let attrs_len: std::os::raw::c_uint = 0;
+        let mut attrs_len: std::os::raw::c_uint = 0;
         va_check(unsafe {
             bindings::vaQuerySurfaceAttributes(
                 self.display.handle(),
                 self.id,
                 std::ptr::null_mut(),
-                &attrs_len as *const _ as *mut std::os::raw::c_uint,
+                &mut attrs_len,
             )
         })?;
 
-        let mut attrs = Vec::with_capacity(attrs_len as usize);
+        let room = attrs_len as usize;
+        let mut attrs = Vec::with_capacity(room);
         // Safe because we allocate a vector with the required capacity as
         // returned by the initial call to vaQuerySurfaceAttributes. We then
         // pass a valid pointer to it.
@@ -93,14 +94,14 @@ impl Config {
                 self.display.handle(),
                 self.id,
                 attrs.as_mut_ptr(),
-                &attrs_len as *const _ as *mut std::os::raw::c_uint,
+                &mut attrs_len,
             )
         })?;
 
         // Safe because vaQuerySurfaceAttributes will have written to
-        // exactly attrs_len entries in the vector.
+        // exactly attrs_len entries in the vector, never more than it was given room for.
         unsafe {
-            attrs.set_len(attrs_len as usize);
+            attrs.set_len((attrs_len as usize).min(room));
         }
 
         Ok(attrs)

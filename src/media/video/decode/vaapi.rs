@@ -27,7 +27,7 @@ use crate::media::video::pipeline::{Codec, DecodedFrame, Decoder, Packet, PipeRe
 use crate::media::video::yuv::{Chroma, ChromaPlanes, Converter, Matrix, Plane, YuvImage};
 
 #[cfg(nsc_vaapi_embedded)]
-const HELPER_ABI: u32 = 2;
+const HELPER_ABI: u32 = 3;
 
 #[cfg(nsc_vaapi_embedded)]
 static HELPER_SO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vaapi-helper.so"));
@@ -49,7 +49,15 @@ struct NscVaFrame {
     pitch: u32,
     buffer: u64,
     token: u64,
+    /// the YCbCr matrix of the NV12 planes, from the stream's headers: 1 (BT.709),
+    /// 6 (BT.601) or 9 (BT.2020)
+    matrix: u32,
+    full_range: bool,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () =
+    assert!(size_of::<NscVaFrame>() == 96 && std::mem::offset_of!(NscVaFrame, full_range) == 92);
 
 type FrameCb = unsafe extern "C" fn(*mut c_void, *const NscVaFrame);
 
@@ -299,8 +307,12 @@ unsafe extern "C" fn on_frame(user: *mut c_void, f: *const NscVaFrame) {
             height: f.height,
             bit_depth: 8,
             chroma: Chroma::Sub420,
-            matrix: Matrix::guess(f.height),
-            full_range: false,
+            matrix: match f.matrix {
+                1 => Matrix::Bt709,
+                9 => Matrix::Bt2020,
+                _ => Matrix::Bt601,
+            },
+            full_range: f.full_range,
             y: Plane {
                 data: y,
                 stride: f.y_stride,
@@ -456,7 +468,7 @@ mod tests {
         let (on, why) = gpu.in_video_memory();
         assert!(on, "no video processor on {}: {why}", node.display());
         let Ok(mut cpu) = H264Decoder::new() else {
-            eprintln!("no openh264 — skipping");
+            eprintln!("no openh264 - skipping");
             return;
         };
 
@@ -515,6 +527,116 @@ mod tests {
         assert_eq!(size, (320, 180));
         eprintln!("at half the size: {diff:.2} levels apart on average");
         assert!(diff < 4.0, "the scaled picture is off by {diff:.2} levels");
+    }
+
+    /// An NV12 frame in memory as the helper hands it out: `w` x `h`, rows `strides` bytes
+    /// apart, the planes no longer than the last row needs.
+    fn nv12_frame(
+        (w, h): (usize, usize),
+        strides: (usize, usize),
+        (y, u, v): (u8, u8, u8),
+        (matrix, full_range): (u32, bool),
+    ) -> (NscVaFrame, Vec<u8>, Vec<u8>) {
+        let ys = vec![y; strides.0 * (h - 1) + w];
+        let uv_len = strides.1 * (h.div_ceil(2) - 1) + w.div_ceil(2) * 2;
+        let uvs: Vec<u8> = [u, v].into_iter().cycle().take(uv_len).collect();
+        let f = NscVaFrame {
+            width: w as u32,
+            height: h as u32,
+            y: ys.as_ptr(),
+            y_stride: strides.0,
+            uv: uvs.as_ptr(),
+            uv_stride: strides.1,
+            pts_ns: 0,
+            fd: -1,
+            drm_format: 0,
+            modifier: 0,
+            offset: 0,
+            pitch: 0,
+            buffer: 0,
+            token: 0,
+            matrix,
+            full_range,
+        };
+        (f, ys, uvs)
+    }
+
+    /// The pixels on_frame makes of a frame in memory.
+    fn through_on_frame(f: &NscVaFrame) -> crate::frame::CpuFrame {
+        let (mut conv, released) = (Converter::default(), Released::default());
+        let mut sink = Sink {
+            frames: Vec::new(),
+            conv: &mut conv,
+            released: &released,
+        };
+        // SAFETY: the sink and the frame (with its planes) outlive the call.
+        unsafe { on_frame((&raw mut sink).cast(), f) };
+        let mut frames = sink.frames;
+        assert_eq!(frames.len(), 1, "on_frame made no frame");
+        let FrameData::Cpu(cpu) = frames.remove(0).data else {
+            panic!("a frame in memory came out in video memory");
+        };
+        cpu
+    }
+
+    /// A frame that comes through memory is converted with the matrix and range the
+    /// helper read from the stream, not with a guess from its height.
+    #[test]
+    fn a_frame_in_memory_has_the_streams_colours() {
+        let (size, strides, yuv) = ((4, 4), (4, 4), (60, 90, 200));
+        let convert = |matrix: Matrix, full_range: bool| {
+            let (f, ys, uvs) = nv12_frame(size, strides, yuv, (1, false));
+            let img = YuvImage {
+                width: f.width,
+                height: f.height,
+                bit_depth: 8,
+                chroma: Chroma::Sub420,
+                matrix,
+                full_range,
+                y: Plane {
+                    data: &ys,
+                    stride: f.y_stride,
+                },
+                uv: ChromaPlanes::Interleaved(Plane {
+                    data: &uvs,
+                    stride: f.uv_stride,
+                }),
+            };
+            Converter::default().convert(&img).unwrap().pixels.to_vec()
+        };
+        let mut seen = Vec::new();
+        for (code, matrix, full_range) in [
+            (1, Matrix::Bt709, false),
+            (6, Matrix::Bt601, false),
+            (9, Matrix::Bt2020, false),
+            (1, Matrix::Bt709, true),
+            (9, Matrix::Bt2020, true),
+        ] {
+            let (f, _ys, _uvs) = nv12_frame(size, strides, yuv, (code, full_range));
+            let got = through_on_frame(&f).pixels.to_vec();
+            assert_eq!(
+                got,
+                convert(matrix, full_range),
+                "{matrix:?}, full {full_range}"
+            );
+            assert!(
+                !seen.contains(&got),
+                "{matrix:?}, full {full_range}: same as another"
+            );
+            seen.push(got);
+        }
+        // full range black stays a dark grey, the way it was coded
+        let (f, _ys, _uvs) = nv12_frame(size, strides, (16, 128, 128), (1, true));
+        assert_eq!(through_on_frame(&f).pixels[..3], [16, 16, 16]);
+    }
+
+    /// An odd width: the UV row has a pair for the last pixel too, and the helper hands out
+    /// strides that hold it.
+    #[test]
+    fn a_frame_in_memory_with_an_odd_width() {
+        let (f, _ys, _uvs) = nv12_frame((5, 3), (5, 6), (120, 128, 128), (6, false));
+        let cpu = through_on_frame(&f);
+        assert_eq!((cpu.width, cpu.height), (5, 3));
     }
 
     #[test]

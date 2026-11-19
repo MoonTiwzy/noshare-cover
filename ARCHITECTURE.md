@@ -119,10 +119,14 @@ when nobody watches.
 
 In video memory: VA-API on the compositor's own GPU. The helper has the GPU's video processor
 (VPP) convert each decoded NV12 frame into an RGB surface of the size it is drawn at and
-exports that as a dma-buf; the layer imports it. Nothing is copied to system memory. The
+exports that as a dma-buf; the layer imports it. Nothing is copied to system memory, except
+a frame whose stream names the BT.2020 matrix: Intel's iHD, AMD's VPE and Mesa's compositor
+before 26.2 would convert it with BT.709, so it takes the pixel path. The
 picture belongs to its frame until the frame is dropped, then its token goes back to the
-helper with the next packet. The colours are given to the VPP explicitly (matrix and range
-only, same primaries and transfer on both sides), so the result matches the pixel path.
+helper with the next packet. The colours, which the helper reads from the stream's headers
+(a stream that names no matrix gets BT.709 from 720 lines up, BT.601 below), are given to
+the VPP explicitly (matrix and range only, same primaries and transfer on both sides), so the
+result matches the pixel path.
 NVDEC keeps copying: its frames can't be exported as dma-bufs.
 
 ## Coexisting with other plugins

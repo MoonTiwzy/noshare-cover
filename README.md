@@ -28,7 +28,8 @@ it was. With this plugin they see what you chose instead. On your own screen not
 - **Or no file at all.** `"blur"` and `"pixelate"` show the window's own picture made
   unreadable; `"transparent"` leaves the window out of the capture as if it were not there.
 - **Cheap videos.** Decoded on the GPU (NVDEC, VA-API) with a CPU fallback; a VA-API frame
-  never leaves video memory, and the screen repaints only when the cover has a new frame.
+  stays in video memory (unless its stream names the BT.2020 matrix), and the screen repaints
+  only when the cover has a new frame.
 - **Small and self-contained.** The core is Rust (media, decoding, playback clock, lifecycle,
   public API), with a thin C++ layer for Hyprland's plugin API. No FFmpeg, no cairo, no
   external processes.
@@ -76,10 +77,11 @@ with, or the first render node when that isn't known) and falls back to the CPU;
 falls back; `"cpu"` never touches the GPU. A missing library is not an error for the plugin: it
 tells you once which package to install and uses what is there.
 
-A video decoded with VA-API on the GPU the compositor draws with never leaves video memory:
+A video decoded with VA-API on the GPU the compositor draws with stays in video memory:
 the GPU's video processor turns each frame into an RGB picture of the size it is shown at, and
 Hyprland imports that as a texture. Everywhere else (NVDEC, the CPU decoders, a decoder on
-another GPU) a frame is converted to BGRA on the CPU (with AVX2 where the CPU has it) and
+another GPU, a video whose stream names the BT.2020 matrix, which most video processors would
+convert with BT.709) a frame is converted to BGRA on the CPU (with AVX2 where the CPU has it) and
 uploaded; a video shown smaller than it is gets halved first, so a 4K clip in a small window
 costs about what a small clip does. If Hyprland's driver doesn't take a frame from video
 memory, the cover switches to the second way by itself.
@@ -417,7 +419,8 @@ Set `backend = "gpu"` and a video `path_cover`, start any screen capture, then r
 `/tmp/nsc.log` and the Hyprland notification: with `gpu` the plugin never falls back, so a GPU
 problem is reported instead of hidden. Useful: `vainfo` (VA-API driver present), `nvidia-smi`.
 A line `from video memory, buffer N imported: ok` in the log means the frames are shown without
-being copied to system memory.
+being copied to system memory. A video whose stream names the BT.2020 matrix never logs it: its
+frames are converted on the CPU, so they keep their colours.
 
 `gpu_device` can point at another GPU than the one that runs the session, e.g. decode the
 covers on an AMD or Intel iGPU and keep the NVIDIA card free (the frames then go through

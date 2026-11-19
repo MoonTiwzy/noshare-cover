@@ -113,14 +113,21 @@ impl Display {
 
         // Safe because fd represents a valid file descriptor and the pointer is checked for
         // NULL afterwards.
-        let display = unsafe { bindings::vaGetDisplayDRM(file.as_raw_fd()) };
-        if display.is_null() {
+        let handle = unsafe { bindings::vaGetDisplayDRM(file.as_raw_fd()) };
+        if handle.is_null() {
             return Err(OpenDrmDisplayError::VaGetDisplayDrm);
         }
+        // noshare-cover: owned from here on, so a failure below still ends in vaTerminate
+        // (Drop), which frees what vaGetDisplayDRM allocated. libva allows it on a display
+        // that never initialized: with no driver loaded it only releases the display.
+        let display = Self {
+            handle,
+            drm_file: file,
+        };
 
         if let Some(driver) = driver {
             // Safe because the display is valid and not initialized yet; libva copies the name.
-            va_check(unsafe { bindings::vaSetDriverName(display, driver.as_ptr().cast_mut()) })
+            va_check(unsafe { bindings::vaSetDriverName(handle, driver.as_ptr().cast_mut()) })
                 .map_err(OpenDrmDisplayError::VaSetDriverName)?;
         }
 
@@ -128,14 +135,9 @@ impl Display {
         let mut minor = 0i32;
         // Safe because we ensure that the display is valid (i.e not NULL) before calling
         // vaInitialize. The File will close the DRM fd on drop.
-        va_check(unsafe { bindings::vaInitialize(display, &mut major, &mut minor) })
-            .map(|()| {
-                Rc::new(Self {
-                    handle: display,
-                    drm_file: file,
-                })
-            })
-            .map_err(OpenDrmDisplayError::VaInitialize)
+        va_check(unsafe { bindings::vaInitialize(handle, &mut major, &mut minor) })
+            .map_err(OpenDrmDisplayError::VaInitialize)?;
+        Ok(Rc::new(display))
     }
 
     /// Opens the first device that succeeds and returns its `Display`.
