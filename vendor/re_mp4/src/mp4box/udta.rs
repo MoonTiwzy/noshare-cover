@@ -55,6 +55,12 @@ impl<R: Read + Seek> ReadBox<&mut R> for UdtaBox {
         let mut current = reader.stream_position()?;
         let end = start + size;
         while current < end {
+            // QuickTime may end the user data with a 32-bit 0 (QTFF, User Data Atoms): what
+            // is left is too short for a box header, and no box
+            if end - current < HEADER_SIZE {
+                break;
+            }
+
             // Get box header.
             let header = BoxHeader::read(reader)?;
             let BoxHeader { name, size: s } = header;

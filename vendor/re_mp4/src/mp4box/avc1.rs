@@ -203,7 +203,9 @@ impl<R: Read + Seek> ReadBox<&mut R> for AvcCBox {
         }
 
         let content_end = reader.stream_position()?;
-        let remainder = size - HEADER_SIZE - (content_end - content_start);
+        let remainder = (size - HEADER_SIZE)
+            .checked_sub(content_end - content_start)
+            .ok_or(Error::InvalidData("avcC parameter sets run past its end"))?;
         let mut ext = vec![0u8; remainder as usize];
         reader.read_exact(&mut ext)?;
 

@@ -100,7 +100,9 @@ impl<R: Read + Seek> ReadBox<&mut R> for EmsgBox {
             _ => return Err(Error::InvalidData("version must be 0 or 1")),
         };
 
-        let message_size = size - Self::size_without_message(version, &scheme_id_uri, &value);
+        let message_size = size
+            .checked_sub(Self::size_without_message(version, &scheme_id_uri, &value))
+            .ok_or(Error::InvalidData("emsg fields run past its end"))?;
         let mut message_data = Vec::with_capacity(message_size as usize);
         for _ in 0..message_size {
             message_data.push(reader.read_u8()?);

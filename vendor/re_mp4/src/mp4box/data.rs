@@ -6,7 +6,8 @@ use std::{
 use serde::Serialize;
 
 use crate::mp4box::{
-    box_start, BigEndian, BoxType, DataType, Mp4Box, ReadBox, ReadBytesExt, Result, HEADER_SIZE,
+    box_start, BigEndian, BoxType, DataType, Error, Mp4Box, ReadBox, ReadBytesExt, Result,
+    HEADER_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -57,7 +58,10 @@ impl<R: Read + Seek> ReadBox<&mut R> for DataBox {
         reader.read_u32::<BigEndian>()?; // reserved = 0
 
         let current = reader.stream_position()?;
-        let mut data = vec![0u8; (start + size - current) as usize];
+        let len = (start + size)
+            .checked_sub(current)
+            .ok_or(Error::InvalidData("data box too small"))?;
+        let mut data = vec![0u8; len as usize];
         reader.read_exact(&mut data)?;
 
         Ok(Self { data, data_type })

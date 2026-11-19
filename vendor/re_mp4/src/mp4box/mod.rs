@@ -275,8 +275,23 @@ impl BoxHeader {
         Self { name, size }
     }
 
-    // TODO: if size is 0, then this box is the last one in the file
+    /// Reads the header of a box inside another box. Its size must cover at least the
+    /// header: a box inside another can't run to the end of the file (size 0), and one that
+    /// ends before its header does would be read again and again by the loop over the boxes
+    /// of the one it is in.
     pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
+        let header = Self::read_top_level(reader)?;
+        if header.size < HEADER_SIZE {
+            return Err(Error::InvalidData(
+                "a box inside another box has a size of 0",
+            ));
+        }
+        Ok(header)
+    }
+
+    /// Reads the header of a box at the top level of a file, where a size of 0 says that
+    /// the box runs to the end of the file. Any other size covers at least the header.
+    pub fn read_top_level<R: Read>(reader: &mut R) -> Result<Self> {
         // Create and read to buf.
         let mut buf = [0u8; 8]; // 8 bytes for box header.
         reader.read_exact(&mut buf)?;
@@ -306,6 +321,8 @@ impl BoxHeader {
                     16..=u64::MAX => largesize - 8,
                 },
             })
+        } else if (2..HEADER_SIZE as u32).contains(&size) {
+            Err(Error::InvalidData("box size smaller than its header"))
         } else {
             Ok(Self {
                 name: BoxType::from(typ),

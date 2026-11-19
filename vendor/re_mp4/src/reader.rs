@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
 use crate::{
-    skip_box, BoxHeader, BoxType, EmsgBox, Error, FtypBox, MoofBox, MoovBox, ReadBox, Result,
-    StblBox, StsdBoxContent, TfhdBox, TrackId, TrackKind, TrakBox, TrunBox,
+    skip_box, BoxHeader, BoxType, EmsgBox, Error, FtypBox, MdhdBox, MoofBox, MoovBox, ReadBox,
+    Result, StsdBoxContent, TfhdBox, TrackId, TrackKind, TrakBox, TrunBox,
 };
 
 #[derive(Debug)]
@@ -32,7 +32,23 @@ impl Mp4 {
         Ok((Self::read_bytes(&bytes)?, bytes))
     }
 
-    pub fn read<R: Read + Seek>(mut reader: R, size: u64) -> Result<Self> {
+    pub fn read<R: Read + Seek>(reader: R, size: u64) -> Result<Self> {
+        Self::read_tracks(reader, size, |_| true)
+    }
+
+    /// The most samples read from a file, in all its tracks read together: 24 hours at
+    /// 90 frames a second fit. At 56 bytes a [`Sample`], they take up to 470 MB; sample
+    /// tables that claim more are refused before that is allocated.
+    pub const MAX_SAMPLES: u64 = 1 << 23;
+
+    /// Like [`Self::read`], with the samples of only the tracks `wanted` picks. The others
+    /// are listed without samples, and their sample tables are not walked: a track the
+    /// caller has no use for can't make the file unreadable, nor take memory.
+    pub fn read_tracks<R: Read + Seek>(
+        mut reader: R,
+        size: u64,
+        wanted: impl Fn(&TrakBox) -> bool,
+    ) -> Result<Self> {
         let start = reader.stream_position()?;
 
         let mut ftyp = None;
@@ -44,7 +60,7 @@ impl Mp4 {
         let mut current = start;
         while current < size {
             // Get box header.
-            let header = BoxHeader::read(&mut reader)?;
+            let header = BoxHeader::read_top_level(&mut reader)?;
             let BoxHeader { name, size: s } = header;
             if s > size {
                 return Err(Error::InvalidData(
@@ -104,8 +120,9 @@ impl Mp4 {
             tracks: Default::default(),
         };
 
-        let mut tracks = this.build_tracks();
-        this.update_sample_list(&mut tracks)?;
+        let mut budget = SampleBudget::new(size);
+        let mut tracks = this.build_tracks(&wanted, &mut budget)?;
+        this.update_sample_list(&mut tracks, &wanted, &mut budget)?;
         this.tracks = tracks;
         this.update_tracks();
 
@@ -116,188 +133,29 @@ impl Mp4 {
         &self.tracks
     }
 
-    /// Process each `trak` box to obtain a list of samples for each track.
+    /// The tracks, taken out of the file: their samples without a copy.
+    pub fn into_tracks(self) -> BTreeMap<TrackId, Track> {
+        self.tracks
+    }
+
+    /// Process each `trak` box to obtain a list of samples for each track `wanted` picks;
+    /// the others are listed without samples.
     ///
     /// Note that the list will be incomplete if the file is fragmented.
-    fn build_tracks(&mut self) -> BTreeMap<TrackId, Track> {
+    fn build_tracks(
+        &mut self,
+        wanted: &dyn Fn(&TrakBox) -> bool,
+        budget: &mut SampleBudget,
+    ) -> Result<BTreeMap<TrackId, Track>> {
         let mut tracks = BTreeMap::new();
 
         // load samples from traks
         for trak in &self.moov.traks {
-            let mut sample_n = 0usize;
-            let mut chunk_index = 1u64;
-            let mut chunk_run_index = 0usize;
-            let mut last_sample_in_chunk = 0u64;
-            let mut offset_in_chunk = 0u64;
-            let mut last_chunk_in_run = 0u64;
-            let mut last_sample_in_stts_run = -1i64;
-            let mut stts_run_index = -1i64;
-            let mut last_stss_index = 0;
-            let mut last_sample_in_ctts_run = -1i64;
-            let mut ctts_run_index = -1i64;
-            let mut dts_shift = 0;
-
-            // The smallest presentation timestamp observed in this stream.
-            //
-            // This is typically 0, but in the presence of sample reordering (caused by AVC/HVC b-frames), it may be non-zero.
-            // In fact, many formats don't require this to be zero, but video players typically
-            // normalize the shown time to start at zero.
-            // This is roughly equivalent to FFmpeg's internal `min_corrected_pts`
-            // https://github.com/FFmpeg/FFmpeg/blob/4047b887fc44b110bccb1da09bcb79d6e454b88b/libavformat/isom.h#L202
-            // To learn more about this I recommend reading the patch that introduced this in FFmpeg:
-            // https://patchwork.ffmpeg.org/project/ffmpeg/patch/20170606181601.25187-1-isasi@google.com/#12592
-            let mut min_composition_timestamp = i64::MAX;
-
-            let mut samples = Vec::<Sample>::new();
-
-            fn get_sample_chunk_offset(stbl: &StblBox, chunk_index: u64) -> u64 {
-                if let Some(stco) = &stbl.stco {
-                    stco.entries[chunk_index as usize - 1] as u64
-                } else if let Some(co64) = &stbl.co64 {
-                    co64.entries[chunk_index as usize - 1]
-                } else {
-                    panic!()
-                }
-            }
-
-            let stbl = &trak.mdia.minf.stbl;
-            let stsc = &stbl.stsc;
-            let stsz = &stbl.stsz;
-            let stts = &stbl.stts;
-
-            // Could probably just always use sample count
-            while (sample_n < stsz.sample_sizes.len() && stsz.sample_size == 0)
-                || sample_n < stsz.sample_count as usize
-            {
-                // compute offset
-                if sample_n == 0 {
-                    chunk_index = 1;
-                    chunk_run_index = 0;
-                    last_sample_in_chunk = stsc.entries[chunk_run_index].samples_per_chunk as u64;
-                    offset_in_chunk = 0;
-
-                    if chunk_run_index + 1 < stsc.entries.len() {
-                        last_chunk_in_run =
-                            stsc.entries[chunk_run_index + 1].first_chunk as u64 - 1;
-                    } else {
-                        last_chunk_in_run = u64::MAX;
-                    }
-                } else if sample_n < last_sample_in_chunk as usize {
-                    /* ... */
-                } else {
-                    chunk_index += 1;
-                    offset_in_chunk = 0;
-                    if chunk_index > last_chunk_in_run {
-                        chunk_run_index += 1;
-                        if chunk_run_index + 1 < stsc.entries.len() {
-                            last_chunk_in_run =
-                                stsc.entries[chunk_run_index + 1].first_chunk as u64 - 1;
-                        } else {
-                            last_chunk_in_run = u64::MAX;
-                        }
-                    }
-
-                    last_sample_in_chunk += stsc.entries[chunk_run_index].samples_per_chunk as u64;
-                }
-
-                // compute timestamp, duration, is_sync
-                if sample_n as i64 > last_sample_in_stts_run {
-                    stts_run_index += 1;
-                    if last_sample_in_stts_run < 0 {
-                        last_sample_in_stts_run = 0;
-                    }
-                    last_sample_in_stts_run +=
-                        stts.entries[stts_run_index as usize].sample_count as i64;
-                }
-
-                let timescale = trak.mdia.mdhd.timescale as u64;
-                let size = if stsz.sample_size == 0 {
-                    stsz.sample_sizes[sample_n] as u64
-                } else {
-                    stsz.sample_size as u64
-                };
-                let offset = get_sample_chunk_offset(stbl, chunk_index) + offset_in_chunk;
-                offset_in_chunk += size;
-
-                let decode_timestamp = if sample_n > 0 {
-                    samples[sample_n - 1].duration =
-                        stts.entries[stts_run_index as usize].sample_delta as u64;
-
-                    samples[sample_n - 1].decode_timestamp + samples[sample_n - 1].duration as i64
-                } else {
-                    0
-                };
-
-                let composition_timestamp = if let Some(ctts) = &stbl.ctts {
-                    if sample_n as i64 >= last_sample_in_ctts_run {
-                        ctts_run_index += 1;
-                        if last_sample_in_ctts_run < 0 {
-                            last_sample_in_ctts_run = 0;
-                        }
-                        last_sample_in_ctts_run +=
-                            ctts.entries[ctts_run_index as usize].sample_count as i64;
-                    }
-
-                    // dts shift is determined by the smallest negative sample offset:
-                    // https://github.com/FFmpeg/FFmpeg/blob/455db6fe109cf905fe518ea2690495948937438f/libavformat/mov.c#L3671
-                    let offset = ctts.entries[ctts_run_index as usize].sample_offset as i64;
-                    if offset < 0 {
-                        dts_shift = dts_shift.max(-offset);
-                    }
-
-                    decode_timestamp + offset
-                } else {
-                    decode_timestamp
-                };
-                min_composition_timestamp = min_composition_timestamp.min(composition_timestamp);
-
-                let is_sync = if let Some(stss) = &stbl.stss {
-                    if last_stss_index < stss.entries.len()
-                        && sample_n == stss.entries[last_stss_index] as usize - 1
-                    {
-                        last_stss_index += 1;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                };
-
-                samples.push(Sample {
-                    id: samples.len() as u32,
-                    timescale,
-                    size,
-                    offset,
-                    decode_timestamp,
-                    composition_timestamp,
-                    is_sync,
-                    duration: 0, // filled once we know next sample timestamp
-                });
-                sample_n += 1;
-            }
-
-            if let Some(last_sample) = samples.last_mut() {
-                last_sample.duration =
-                    trak.mdia.mdhd.duration - last_sample.decode_timestamp as u64;
-            }
-
-            // Fixup all DTS by the dts shift if there's one.
-            // https://github.com/FFmpeg/FFmpeg/blob/455db6fe109cf905fe518ea2690495948937438f/libavformat/mov.c#L4271
-            if dts_shift > 0 {
-                for sample in &mut samples {
-                    sample.decode_timestamp -= dts_shift;
-                }
-            }
-
-            // Shift both DTS & CTS by the smallest CTS.
-            // For details, see declaration of `min_composition_timestamp` above.
-            if min_composition_timestamp != 0 {
-                for sample in &mut samples {
-                    sample.decode_timestamp -= min_composition_timestamp;
-                    sample.composition_timestamp -= min_composition_timestamp;
-                }
-            }
+            let (samples, shift) = if wanted(trak) {
+                Self::trak_samples(trak, budget)?
+            } else {
+                Default::default()
+            };
 
             tracks.insert(
                 trak.tkhd.track_id,
@@ -306,23 +164,218 @@ impl Mp4 {
                     width: trak.tkhd.width.value(),
                     height: trak.tkhd.height.value(),
                     first_traf_merged: false,
+                    shift,
                     timescale: trak.mdia.mdhd.timescale as u64,
-                    duration: trak.mdia.mdhd.duration,
+                    duration: media_duration(&trak.mdia.mdhd),
                     kind: trak.mdia.minf.stbl.stsd.kind(),
                     samples,
                 },
             );
         }
 
-        tracks
+        Ok(tracks)
+    }
+
+    /// The samples of a `trak` box, from its sample tables, and what was taken off their
+    /// timestamps.
+    fn trak_samples(trak: &TrakBox, budget: &mut SampleBudget) -> Result<(Vec<Sample>, TimeShift)> {
+        let stbl = &trak.mdia.minf.stbl;
+        let stsc = &stbl.stsc;
+        let stsz = &stbl.stsz;
+        let timescale = trak.mdia.mdhd.timescale as u64;
+        let media_duration = media_duration(&trak.mdia.mdhd);
+
+        let sample_count = if stsz.sample_size == 0 {
+            stsz.sample_sizes.len()
+        } else {
+            stsz.sample_count as usize
+        };
+        budget.take(sample_count as u64)?;
+
+        // The file offset of a chunk, counted from 1.
+        let chunk_offset = |chunk: usize| -> Option<u64> {
+            let index = chunk.checked_sub(1)?;
+            if let Some(stco) = &stbl.stco {
+                stco.entries.get(index).map(|&offset| u64::from(offset))
+            } else {
+                stbl.co64.as_ref()?.entries.get(index).copied()
+            }
+        };
+
+        // The chunk the next sample is in (counted from 1), the stsc entry for that
+        // chunk, how many samples the chunk has left and where the next one starts.
+        let mut chunk = 0usize;
+        let mut chunk_run = 0usize;
+        let mut left_in_chunk = 0u64;
+        let mut offset_in_file = 0u64;
+
+        let mut stts_runs = Runs::new(&stbl.stts.entries);
+        let mut ctts_runs = stbl.ctts.as_ref().map(|ctts| Runs::new(&ctts.entries));
+        let mut next_stss_index = 0;
+        let mut next_decode_timestamp = 0i64;
+        let mut dts_shift = 0;
+
+        // The smallest presentation timestamp observed in this stream.
+        //
+        // This is typically 0, but in the presence of sample reordering (caused by AVC/HVC b-frames), it may be non-zero.
+        // In fact, many formats don't require this to be zero, but video players typically
+        // normalize the shown time to start at zero.
+        // This is roughly equivalent to FFmpeg's internal `min_corrected_pts`
+        // https://github.com/FFmpeg/FFmpeg/blob/4047b887fc44b110bccb1da09bcb79d6e454b88b/libavformat/isom.h#L202
+        // To learn more about this I recommend reading the patch that introduced this in FFmpeg:
+        // https://patchwork.ffmpeg.org/project/ffmpeg/patch/20170606181601.25187-1-isasi@google.com/#12592
+        let mut min_composition_timestamp = i64::MAX;
+
+        // Grown as the samples are walked, not reserved for all the tables claim: tables
+        // that break off after claiming millions of samples take no more than they gave.
+        let mut samples = Vec::<Sample>::new();
+
+        for sample_n in 0..sample_count {
+            // compute offset: move on to the next chunk with samples once this one is
+            // used up (an stsc entry may give its chunks no samples)
+            while left_in_chunk == 0 {
+                chunk += 1;
+                while stsc
+                    .entries
+                    .get(chunk_run + 1)
+                    .is_some_and(|next| next.first_chunk as usize <= chunk)
+                {
+                    chunk_run += 1;
+                }
+                let Some(run) = stsc.entries.get(chunk_run) else {
+                    return Err(Error::InvalidData("stsc has no entries for the samples"));
+                };
+                offset_in_file = chunk_offset(chunk).ok_or(Error::InvalidData(
+                    "stsc places samples in more chunks than stco/co64 has",
+                ))?;
+                left_in_chunk = u64::from(run.samples_per_chunk);
+            }
+            left_in_chunk -= 1;
+
+            let size = if stsz.sample_size == 0 {
+                stsz.sample_sizes
+                    .get(sample_n)
+                    .map_or(0, |&size| u64::from(size))
+            } else {
+                u64::from(stsz.sample_size)
+            };
+            let offset = offset_in_file;
+            offset_in_file = offset_in_file.saturating_add(size);
+
+            // compute timestamp, duration, is_sync
+            let decode_timestamp = next_decode_timestamp;
+            let duration = match stts_runs.next_sample(|entry| entry.sample_count) {
+                Some(entry) => u64::from(entry.sample_delta),
+                // an stts one sample short: the last sample lasts until the media ends
+                None if sample_n + 1 == sample_count => {
+                    media_duration.saturating_sub(decode_timestamp.unsigned_abs())
+                }
+                None => return Err(Error::InvalidData("stts describes fewer samples than stsz")),
+            };
+            next_decode_timestamp = decode_timestamp
+                .checked_add_unsigned(duration)
+                .ok_or(Error::InvalidData("sample timestamps overflow"))?;
+
+            let composition_timestamp = if let Some(ctts_runs) = &mut ctts_runs {
+                // past the end of a short ctts: no offset
+                let offset = ctts_runs
+                    .next_sample(|entry| entry.sample_count)
+                    .map_or(0, |entry| i64::from(entry.sample_offset));
+
+                // dts shift is determined by the smallest negative sample offset:
+                // https://github.com/FFmpeg/FFmpeg/blob/455db6fe109cf905fe518ea2690495948937438f/libavformat/mov.c#L3671
+                if offset < 0 {
+                    dts_shift = dts_shift.max(-offset);
+                }
+
+                decode_timestamp
+                    .checked_add(offset)
+                    .ok_or(Error::InvalidData("sample timestamps overflow"))?
+            } else {
+                decode_timestamp
+            };
+            min_composition_timestamp = min_composition_timestamp.min(composition_timestamp);
+
+            let is_sync = if let Some(stss) = &stbl.stss {
+                // stss numbers the sync samples from 1, in increasing order
+                let number = sample_n as u64 + 1;
+                while stss
+                    .entries
+                    .get(next_stss_index)
+                    .is_some_and(|&n| u64::from(n) < number)
+                {
+                    next_stss_index += 1;
+                }
+                stss.entries
+                    .get(next_stss_index)
+                    .is_some_and(|&n| u64::from(n) == number)
+            } else {
+                true
+            };
+
+            let id = samples.len() as u32;
+            push_sample(
+                &mut samples,
+                Sample {
+                    id,
+                    timescale,
+                    size,
+                    offset,
+                    decode_timestamp,
+                    composition_timestamp,
+                    is_sync,
+                    duration,
+                },
+            )?;
+        }
+
+        // Fixup all DTS by the dts shift if there's one.
+        // https://github.com/FFmpeg/FFmpeg/blob/455db6fe109cf905fe518ea2690495948937438f/libavformat/mov.c#L4271
+        if dts_shift > 0 {
+            for sample in &mut samples {
+                sample.decode_timestamp -= dts_shift;
+            }
+        }
+
+        // Shift both DTS & CTS by the smallest CTS.
+        // For details, see declaration of `min_composition_timestamp` above.
+        if min_composition_timestamp != 0 {
+            for sample in &mut samples {
+                sample.decode_timestamp = sample
+                    .decode_timestamp
+                    .saturating_sub(min_composition_timestamp);
+                sample.composition_timestamp = sample
+                    .composition_timestamp
+                    .saturating_sub(min_composition_timestamp);
+            }
+        }
+
+        let shift = TimeShift {
+            decode: dts_shift,
+            // with no samples there is no smallest one
+            both: if samples.is_empty() {
+                0
+            } else {
+                min_composition_timestamp
+            },
+        };
+        Ok((samples, shift))
     }
 
     /// In case the input file is fragmented, it will contain one or more `moof` boxes,
     /// which must be processed to obtain the full list of samples for each track.
-    fn update_sample_list(&mut self, tracks: &mut BTreeMap<TrackId, Track>) -> Result<()> {
-        let mut last_run_position = 0;
-
+    fn update_sample_list(
+        &mut self,
+        tracks: &mut BTreeMap<TrackId, Track>,
+        wanted: &dyn Fn(&TrakBox) -> bool,
+        budget: &mut SampleBudget,
+    ) -> Result<()> {
         for moof in &self.moofs {
+            // Where the data of the previous track fragment ends: the base data offset of a
+            // track fragment that has none of its own and isn't based at the moof. For the
+            // first one that is the moof (ISO/IEC 14496-12, 8.8.7, tfhd).
+            let mut previous_traf_end = moof.start;
+
             // process moof to update sample list
             for traf in &moof.trafs {
                 let track_id = traf.tfhd.track_id;
@@ -335,6 +388,7 @@ impl Mp4 {
                     .iter()
                     .find(|trak| trak.tkhd.track_id == track_id)
                     .ok_or(Error::TrakNotFound(track_id))?;
+                let read = wanted(trak);
                 let trex = if let Some(mvex) = &self.moov.mvex {
                     mvex.trexs
                         .iter()
@@ -358,7 +412,35 @@ impl Mp4 {
                     .default_sample_flags
                     .unwrap_or(trex.default_sample_flags);
 
-                for (traf_idx, trun) in traf.truns.iter().enumerate() {
+                let base_data_offset = if traf.tfhd.flags & TfhdBox::FLAG_BASE_DATA_OFFSET != 0 {
+                    traf.tfhd.base_data_offset.unwrap_or(moof.start)
+                } else if traf.tfhd.flags & TfhdBox::FLAG_DEFAULT_BASE_IS_MOOF != 0 {
+                    moof.start
+                } else {
+                    previous_traf_end
+                };
+                // Where a run without a data offset of its own starts: right after the
+                // previous run, or at the base data offset for the first (8.8.8, trun).
+                let mut run_start = base_data_offset;
+
+                for trun in &traf.truns {
+                    // Sample offset in bytes. (Must be positive, otherwise this would be outside of the file.)
+                    let mut offset_in_file = match trun.data_offset {
+                        Some(data_offset) => {
+                            base_data_offset.saturating_add_signed(i64::from(data_offset))
+                        }
+                        None => run_start,
+                    };
+
+                    if !read {
+                        // A track not read: only where its run ends matters, as the next
+                        // run, or the next track fragment, may start there.
+                        run_start =
+                            offset_in_file.saturating_add(run_size(trun, default_sample_size));
+                        continue;
+                    }
+                    budget.take(u64::from(trun.sample_count))?;
+
                     for sample_n in 0..trun.sample_count as usize {
                         let mut sample_flags = default_sample_flags;
                         if trun.flags & TrunBox::FLAG_SAMPLE_FLAGS != 0 {
@@ -373,23 +455,36 @@ impl Mp4 {
                             sample_flags = trun.first_sample_flags.unwrap_or(sample_flags);
                         }
 
-                        let mut decode_timestamp = 0;
-                        if track.first_traf_merged || sample_n > 0 {
-                            let prev = &track.samples[track.samples.len() - 1];
-                            decode_timestamp = prev.decode_timestamp + prev.duration as i64;
-                        } else {
-                            if let Some(tfdt) = &traf.tfdt {
-                                decode_timestamp = tfdt.base_media_decode_time as i64;
+                        let decode_timestamp = match (&traf.tfdt, track.samples.last()) {
+                            // the first sample of the track's first fragment: at the decode
+                            // time it gives, moved as the samples in the moov before it were
+                            (Some(tfdt), _) if !track.first_traf_merged && sample_n == 0 => {
+                                let Ok(time) = i64::try_from(tfdt.base_media_decode_time) else {
+                                    return Err(Error::InvalidData(
+                                        "tfdt decode time out of range",
+                                    ));
+                                };
+                                track.shift.decode_timestamp(time)?
                             }
-                            track.first_traf_merged = true;
-                        }
-
-                        let composition_timestamp = if trun.flags & TrunBox::FLAG_SAMPLE_CTS != 0 {
-                            decode_timestamp
-                                + trun.sample_cts.get(sample_n).copied().unwrap_or(0) as i64
-                        } else {
-                            decode_timestamp
+                            // after the sample before, from the moov or a fragment: without a
+                            // tfdt, a fragment starts where the samples before it end
+                            // (ISO/IEC 14496-12, 8.8.12)
+                            (_, Some(prev)) => prev
+                                .decode_timestamp
+                                .checked_add_unsigned(prev.duration)
+                                .ok_or(Error::InvalidData("sample timestamps overflow"))?,
+                            (_, None) => 0,
                         };
+                        track.first_traf_merged = true;
+
+                        let composition_offset = if trun.flags & TrunBox::FLAG_SAMPLE_CTS != 0 {
+                            trun.sample_cts.get(sample_n).copied().unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let composition_timestamp = track
+                            .shift
+                            .composition_timestamp(decode_timestamp, composition_offset)?;
 
                         let duration = trun
                             .sample_durations
@@ -398,58 +493,35 @@ impl Mp4 {
                             .unwrap_or(default_sample_duration)
                             as u64;
 
-                        let base_data_offset_present =
-                            traf.tfhd.flags & TfhdBox::FLAG_BASE_DATA_OFFSET != 0;
-                        let default_base_is_moof =
-                            traf.tfhd.flags & TfhdBox::FLAG_DEFAULT_BASE_IS_MOOF != 0;
-                        let data_offset_present = trun.flags & TrunBox::FLAG_DATA_OFFSET != 0;
-                        let base_data_offset = if !base_data_offset_present {
-                            if !default_base_is_moof {
-                                if sample_n == 0 {
-                                    // the first sample in the track fragment
-                                    moof.start // the position of the first byte of the enclosing Movie Fragment Box
-                                } else {
-                                    last_run_position // the offset of the previous sample
-                                }
-                            } else {
-                                moof.start
-                            }
-                        } else {
-                            traf.tfhd.base_data_offset.unwrap_or(moof.start)
-                        };
-
                         let sample_size =
                             trun.sample_sizes
                                 .get(sample_n)
                                 .copied()
                                 .unwrap_or(default_sample_size) as u64;
 
-                        // Sample offset in bytes. (Must be positive, otherwise this would be outside of the file.)
-                        let sample_offset = if traf_idx == 0 && sample_n == 0 {
-                            if data_offset_present {
-                                base_data_offset
-                                    .saturating_add_signed(trun.data_offset.unwrap_or(0) as i64)
-                            } else {
-                                base_data_offset
-                            }
-                        } else {
-                            last_run_position
-                        };
+                        let offset = offset_in_file;
+                        offset_in_file = offset_in_file.saturating_add(sample_size);
 
-                        last_run_position = sample_offset + sample_size;
-
-                        track.samples.push(Sample {
-                            id: track.samples.len() as u32,
-                            is_sync: (sample_flags >> 16) & 0x1 != 0,
-                            size: sample_size,
-                            offset: sample_offset,
-                            timescale: trak.mdia.mdhd.timescale as u64,
-                            decode_timestamp,
-                            composition_timestamp,
-                            duration,
-                        });
+                        let id = track.samples.len() as u32;
+                        push_sample(
+                            &mut track.samples,
+                            Sample {
+                                id,
+                                is_sync: is_sync_sample(sample_flags),
+                                size: sample_size,
+                                offset,
+                                timescale: trak.mdia.mdhd.timescale as u64,
+                                decode_timestamp,
+                                composition_timestamp,
+                                duration,
+                            },
+                        )?;
                     }
+
+                    run_start = offset_in_file;
                 }
+
+                previous_traf_end = run_start;
             }
         }
 
@@ -470,9 +542,149 @@ impl Mp4 {
     }
 }
 
+/// How many more samples the tracks read may have: one per byte of the file, and
+/// [`Mp4::MAX_SAMPLES`] in all. A few bytes of sample tables can claim billions of samples;
+/// tables that claim more than the budget are refused before their samples are walked.
+struct SampleBudget {
+    left: u64,
+    /// why the tables are refused when they claim more
+    over: &'static str,
+}
+
+impl SampleBudget {
+    fn new(file_size: u64) -> Self {
+        if file_size <= Mp4::MAX_SAMPLES {
+            Self {
+                left: file_size,
+                over: "the sample tables describe more samples than the file has bytes",
+            }
+        } else {
+            Self {
+                left: Mp4::MAX_SAMPLES,
+                over: "the sample tables describe more than 8388608 samples, the most read",
+            }
+        }
+    }
+
+    fn take(&mut self, samples: u64) -> Result<()> {
+        self.left = self
+            .left
+            .checked_sub(samples)
+            .ok_or(Error::InvalidData(self.over))?;
+        Ok(())
+    }
+}
+
+/// Adds a sample to a track's list. Memory the list can't get is an error, not an abort:
+/// the reader may run in a process that must not go down with a broken file.
+fn push_sample(samples: &mut Vec<Sample>, sample: Sample) -> Result<()> {
+    samples
+        .try_reserve(1)
+        .map_err(|_| Error::InvalidData("no memory for the samples"))?;
+    samples.push(sample);
+    Ok(())
+}
+
+/// The bytes a `trun`'s samples take: the sizes it lists, the default size for the samples
+/// it has none for. Counted without walking them: a run can claim 4 billion samples with
+/// no bytes of its own.
+fn run_size(trun: &TrunBox, default_sample_size: u32) -> u64 {
+    let listed = trun.sample_sizes.len().min(trun.sample_count as usize);
+    let sizes = trun.sample_sizes[..listed]
+        .iter()
+        .fold(0u64, |sum, &size| sum.saturating_add(u64::from(size)));
+    let unlisted = u64::from(trun.sample_count) - listed as u64;
+    sizes.saturating_add(unlisted.saturating_mul(u64::from(default_sample_size)))
+}
+
+/// Walks a run-length table (`stts`, `ctts`) one sample at a time.
+struct Runs<'a, T> {
+    entries: std::slice::Iter<'a, T>,
+    entry: Option<&'a T>,
+    left: u32,
+}
+
+impl<'a, T> Runs<'a, T> {
+    fn new(entries: &'a [T]) -> Self {
+        Self {
+            entries: entries.iter(),
+            entry: None,
+            left: 0,
+        }
+    }
+
+    /// The entry the next sample falls under; `None` past the end of the table. Entries
+    /// for no samples are skipped.
+    fn next_sample(&mut self, sample_count: impl Fn(&T) -> u32) -> Option<&'a T> {
+        while self.left == 0 {
+            let entry = self.entries.next()?;
+            self.entry = Some(entry);
+            self.left = sample_count(entry);
+        }
+        self.left -= 1;
+        self.entry
+    }
+}
+
+/// The duration of a track's media from its `mdhd`, 0 when it is unknown: all ones in
+/// either version of the box (ISO/IEC 14496-12, 8.4.2).
+fn media_duration(mdhd: &MdhdBox) -> u64 {
+    let unknown = if mdhd.version == 1 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    if mdhd.duration == unknown {
+        0
+    } else {
+        mdhd.duration
+    }
+}
+
+/// What the samples from a `trak` box had taken off their timestamps (see
+/// [`Mp4::trak_samples`]): the decode timestamps the largest negative composition offset,
+/// and both the smallest composition timestamp. The samples of the track's fragments after
+/// them (ffmpeg's `frag_keyframe` without `empty_moov` puts samples in both) are moved
+/// the same, so their timeline runs on from those.
+#[derive(Default, Clone, Copy)]
+struct TimeShift {
+    decode: i64,
+    both: i64,
+}
+
+impl TimeShift {
+    /// The decode timestamp of a sample at `time` in the track's media.
+    fn decode_timestamp(self, time: i64) -> Result<i64> {
+        time.checked_sub(self.decode)
+            .and_then(|time| time.checked_sub(self.both))
+            .ok_or(Error::InvalidData("sample timestamps overflow"))
+    }
+
+    /// The composition timestamp of a sample with this (moved) decode timestamp and
+    /// composition offset: the offset, and what only the decode timestamps had taken off.
+    fn composition_timestamp(self, decode_timestamp: i64, offset: i64) -> Result<i64> {
+        decode_timestamp
+            .checked_add(offset)
+            .and_then(|time| time.checked_add(self.decode))
+            .ok_or(Error::InvalidData("sample timestamps overflow"))
+    }
+}
+
+/// `sample_is_non_sync_sample` in the sample flags of `trex`, `tfhd` and `trun`
+/// (ISO/IEC 14496-12, 8.8.3): set for a sample that is not a sync sample.
+const SAMPLE_IS_NON_SYNC_SAMPLE: u32 = 1 << 16;
+
+fn is_sync_sample(sample_flags: u32) -> bool {
+    sample_flags & SAMPLE_IS_NON_SYNC_SAMPLE == 0
+}
+
 pub struct Track {
     /// Internal field used when decoding a fragmented MP4 file.
     first_traf_merged: bool,
+
+    /// What the samples from the `trak` box had taken off their timestamps; the samples
+    /// of the track's fragments after them are moved the same.
+    shift: TimeShift,
 
     pub width: u16,
     pub height: u16,

@@ -119,6 +119,11 @@ impl<R: Read + Seek> ReadBox<&mut R> for MetaBox {
             // Get box header.
             let header = BoxHeader::read(reader)?;
             let BoxHeader { name, size: s } = header;
+            if s > size {
+                return Err(Error::InvalidData(
+                    "meta box contains a box with a larger size than it",
+                ));
+            }
 
             match name {
                 BoxType::HdlrBox => {
@@ -148,6 +153,11 @@ impl<R: Read + Seek> ReadBox<&mut R> for MetaBox {
                 // Get box header.
                 let header = BoxHeader::read(reader)?;
                 let BoxHeader { name, size: s } = header;
+                if s > size {
+                    return Err(Error::InvalidData(
+                        "meta box contains a box with a larger size than it",
+                    ));
+                }
 
                 match name {
                     BoxType::IlstBox => {
@@ -170,6 +180,11 @@ impl<R: Read + Seek> ReadBox<&mut R> for MetaBox {
                 // Get box header.
                 let header = BoxHeader::read(reader)?;
                 let BoxHeader { name, size: s } = header;
+                if s > size {
+                    return Err(Error::InvalidData(
+                        "meta box contains a box with a larger size than it",
+                    ));
+                }
 
                 if name == BoxType::HdlrBox {
                     skip_box(reader, s)?;

@@ -22,8 +22,10 @@ pub struct TrunBox {
     pub sample_sizes: Vec<u32>,
     #[serde(skip_serializing)]
     pub sample_flags: Vec<u32>,
+    /// `sample_composition_time_offset`: signed in version 1, unsigned in version 0
+    /// (ISO/IEC 14496-12, 8.8.8), each read as the version says.
     #[serde(skip_serializing)]
-    pub sample_cts: Vec<u32>,
+    pub sample_cts: Vec<i64>,
 }
 
 impl TrunBox {
@@ -136,7 +138,10 @@ impl<R: Read + Seek> ReadBox<&mut R> for TrunBox {
             sample_cts.reserve(sample_count as usize);
         }
 
-        for _ in 0..sample_count {
+        // Only a run with fields for each sample has anything to read for them; one without
+        // can claim 4 billion samples in no bytes.
+        let listed = if sample_size > 0 { sample_count } else { 0 };
+        for _ in 0..listed {
             if Self::FLAG_SAMPLE_DURATION & flags > 0 {
                 let duration = reader.read_u32::<BigEndian>()?;
                 sample_durations.push(duration);
@@ -153,7 +158,11 @@ impl<R: Read + Seek> ReadBox<&mut R> for TrunBox {
             }
 
             if Self::FLAG_SAMPLE_CTS & flags > 0 {
-                let cts = reader.read_u32::<BigEndian>()?;
+                let cts = if version == 0 {
+                    i64::from(reader.read_u32::<BigEndian>()?)
+                } else {
+                    i64::from(reader.read_i32::<BigEndian>()?)
+                };
                 sample_cts.push(cts);
             }
         }
