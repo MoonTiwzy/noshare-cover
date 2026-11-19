@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use libloading::Library;
 
+use super::Refusals;
 use crate::frame::FrameData;
 use crate::media::video::pipeline::{DecodedFrame, Decoder, Packet, PipeResult};
 use crate::media::video::yuv::{Chroma, ChromaPlanes, Converter, Matrix, Plane, YuvImage};
@@ -149,7 +150,7 @@ pub struct H264Decoder {
     // keep the library loaded while pointers into it are alive
     _lib: Library,
     /// Packets in a row that openh264 refused without producing a picture.
-    refused: u32,
+    refusals: Refusals,
     last_state: i32,
     conv: Converter,
 }
@@ -259,7 +260,7 @@ impl H264Decoder {
                 get_option,
                 destroy,
                 _lib: lib,
-                refused: 0,
+                refusals: Refusals::default(),
                 last_state: 0,
                 conv: Converter::default(),
             })
@@ -281,6 +282,19 @@ impl H264Decoder {
         } else {
             0
         }
+    }
+
+    /// The pictures openh264 still holds.
+    fn buffered(&mut self) -> Vec<DecodedFrame> {
+        let mut out = Vec::new();
+        for _ in 0..self.remaining() {
+            let mut dst = [null_mut::<u8>(); 3];
+            let mut info = SBufferInfo::new(0);
+            // SAFETY: same as in decode.
+            unsafe { (self.flush_frame)(self.dec, dst.as_mut_ptr(), &raw mut info) };
+            out.extend(convert(&mut self.conv, &dst, &info));
+        }
+        out
     }
 }
 
@@ -404,33 +418,27 @@ impl Decoder for H264Decoder {
             );
         }
         let frames: Vec<DecodedFrame> = convert(&mut self.conv, &dst, &info).into_iter().collect();
-        if frames.is_empty() && self.last_state != 0 {
-            self.refused += 1;
-            if self.refused >= MAX_REFUSED {
-                return Err(refusal_text(self.last_state));
-            }
-        } else {
-            self.refused = 0;
+        let refused = frames.is_empty() && self.last_state != 0;
+        self.refusals
+            .note(refused, packet.keyframe, !frames.is_empty());
+        if self.refusals.run() >= MAX_REFUSED {
+            return Err(refusal_text(self.last_state));
         }
         Ok(frames)
     }
 
     fn flush(&mut self) -> PipeResult<Vec<DecodedFrame>> {
-        let mut out = Vec::new();
-        for _ in 0..self.remaining() {
-            let mut dst = [null_mut::<u8>(); 3];
-            let mut info = SBufferInfo::new(0);
-            // SAFETY: same as in decode.
-            unsafe { (self.flush_frame)(self.dec, dst.as_mut_ptr(), &raw mut info) };
-            out.extend(convert(&mut self.conv, &dst, &info));
-        }
+        let out = self.buffered();
+        self.refusals.flushed(!out.is_empty());
         Ok(out)
     }
 
     fn reset(&mut self) {
         // After a loop the demuxer starts at a keyframe with SPS/PPS, and the decoder
-        // reconfigures itself; the tail of the previous pass is simply dropped.
-        let _ = self.flush();
+        // reconfigures itself; the tail of the previous pass is simply dropped, and so are
+        // its refusals if the pass showed anything.
+        let _ = self.buffered();
+        self.refusals.reset();
     }
 
     fn set_target(&mut self, width: u32, height: u32) {
@@ -445,6 +453,8 @@ impl Decoder for H264Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::video::decode::testing;
+    use crate::media::video::demux;
 
     #[test]
     fn sps_level_is_clamped_only_when_needed() {
@@ -461,5 +471,68 @@ mod tests {
         assert!(clamp_sps_level(&ok).is_none());
         // truncated data doesn't panic
         assert!(clamp_sps_level(&[0, 0, 1, 0x67]).is_none());
+    }
+
+    /// A slice of a P picture that openh264 can't make sense of.
+    fn broken() -> Packet {
+        Packet {
+            pts: Duration::ZERO,
+            keyframe: false,
+            data: [&[0, 0, 0, 1, 0x41][..], &[0x9a; 64]].concat(),
+        }
+    }
+
+    fn decoder() -> Option<H264Decoder> {
+        H264Decoder::new()
+            .inspect_err(|e| eprintln!("no openh264 ({e}), skipping"))
+            .ok()
+    }
+
+    /// A pass that played with a broken tail, then a loop into a head that takes a while
+    /// to decode again: neither is long enough to give the video up, and they don't add up.
+    #[test]
+    fn a_broken_tail_does_not_count_against_the_next_pass() {
+        let Some(clip) = testing::ffmpeg(
+            "h264.mp4",
+            "testsrc=size=64x64:rate=30:duration=1",
+            &["-c:v", "libx264", "-pix_fmt", "yuv420p"],
+        ) else {
+            return;
+        };
+        let Some(mut dec) = decoder() else {
+            return;
+        };
+        let mut d = demux::open(clip.path()).unwrap();
+        let mut shown = 0;
+        while let Some(p) = d.next_packet().unwrap() {
+            shown += dec.decode(&p).unwrap().len();
+        }
+        assert!(shown > 0, "the clip decodes");
+        for _ in 0..MAX_REFUSED - 10 {
+            assert!(dec.decode(&broken()).unwrap().is_empty());
+        }
+        dec.flush().unwrap();
+        dec.reset();
+        for i in 0..MAX_REFUSED - 10 {
+            let r = dec.decode(&broken());
+            assert!(r.is_ok(), "packet {i} after the loop: {:?}", r.err());
+        }
+    }
+
+    /// A clip shorter than the limit that openh264 refuses from start to end still ends
+    /// with the reason when it loops, not hundreds of empty passes later.
+    #[test]
+    fn a_short_clip_openh264_refuses_ends_with_why() {
+        let Some(mut dec) = decoder() else {
+            return;
+        };
+        let pass = MAX_REFUSED / 2 + 5;
+        for _ in 0..pass {
+            assert!(dec.decode(&broken()).is_ok());
+        }
+        dec.flush().unwrap();
+        dec.reset();
+        let failed = (0..pass).position(|_| dec.decode(&broken()).is_err());
+        assert_eq!(failed, Some((MAX_REFUSED - pass - 1) as usize));
     }
 }

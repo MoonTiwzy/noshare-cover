@@ -65,7 +65,7 @@ struct Rect16 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Rect32 {
     left: c_int,
     top: c_int,
@@ -358,6 +358,8 @@ struct State {
     decoder: CuVideoDecoder,
     /// format the decoder was created for
     fmt: Option<VideoFormat>,
+    /// decode surfaces it was created with
+    surfaces: c_int,
     out_w: u32,
     out_h: u32,
     surface_h: u32,
@@ -390,20 +392,68 @@ fn cuda_codec(codec: &Codec) -> Option<c_int> {
     })
 }
 
-/// PCI address of the device behind a render node: /sys/class/drm/renderD128/device → 0000:01:00.0
+/// PCI address of the device behind a render node, found by its device number, so a link
+/// such as /dev/dri/by-path/pci-0000:01:00.0-render leads there too: `0000:01:00.0`.
 fn pci_of_node(node: &Path) -> Option<String> {
-    let name = node.file_name()?;
-    let dev = std::fs::read_link(Path::new("/sys/class/drm").join(name).join("device")).ok()?;
-    Some(dev.file_name()?.to_string_lossy().to_ascii_lowercase())
+    let dev = crate::gpu::device_of_node(node)?;
+    Some(dev.file_name()?.to_string_lossy().into_owned())
 }
 
-/// Whether the render node belongs to an NVIDIA device (vendor 0x10de).
+/// A PCI address `domain:bus:device.function` (hex) as numbers. CUDA writes the domain
+/// with 8 digits (00000000:01:00.0), sysfs with 4 (0000:01:00.0) or more.
+fn pci_address(s: &str) -> Option<(u32, u8, u8, u8)> {
+    let mut parts = s.trim().split(':');
+    let (domain, bus, slot) = (parts.next()?, parts.next()?, parts.next()?);
+    let (device, function) = slot.split_once('.')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let byte = |x: &str| u8::from_str_radix(x, 16).ok();
+    Some((
+        u32::from_str_radix(domain, 16).ok()?,
+        byte(bus)?,
+        byte(device)?,
+        byte(function)?,
+    ))
+}
+
+/// Whether the render node (or a link to it) belongs to an NVIDIA device (vendor 0x10de).
 pub fn node_is_nvidia(node: &Path) -> bool {
-    node.file_name()
-        .and_then(|n| {
-            std::fs::read_to_string(Path::new("/sys/class/drm").join(n).join("device/vendor")).ok()
-        })
+    crate::gpu::device_of_node(node)
+        .and_then(|dev| std::fs::read_to_string(dev.join("vendor")).ok())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("0x10de"))
+}
+
+/// The size frames come out at: the display area with each side rounded up to even. The
+/// decoder wants an even target (nvcuvid: "Should be aligned to 2"), and NV12/P016 chroma
+/// covers 2x2 pixels; FFmpeg's cuvid decoder does the same.
+fn target_size(area: &Rect32) -> (u32, u32) {
+    let even = |n: c_int| (n.max(1) as u32 + 1) & !1;
+    (
+        even(area.right.saturating_sub(area.left)),
+        even(area.bottom.saturating_sub(area.top)),
+    )
+}
+
+/// Decode surfaces for a stream: the parser's minimum, plus two so a frame being copied
+/// out doesn't hold up the decoder.
+fn surfaces_for(f: &VideoFormat) -> c_int {
+    c_int::from(f.min_num_decode_surfaces.max(1)) + 2
+}
+
+/// The decoder made for `old` with `surfaces` goes on with `new` when nothing it was made
+/// for has changed and the stream needs no more surfaces than it has. Then the parser gets
+/// all of them: a fresh parser (after a loop) starts out with one.
+fn reuse(old: &VideoFormat, surfaces: c_int, new: &VideoFormat) -> Option<c_int> {
+    let same = old.codec == new.codec
+        && old.coded_width == new.coded_width
+        && old.coded_height == new.coded_height
+        && old.chroma_format == new.chroma_format
+        && old.bit_depth_luma_minus8 == new.bit_depth_luma_minus8
+        && old.bit_depth_chroma_minus8 == new.bit_depth_chroma_minus8
+        && old.progressive_sequence == new.progressive_sequence
+        && old.display_area == new.display_area;
+    (same && surfaces_for(new) <= surfaces).then_some(surfaces)
 }
 
 impl NvdecDecoder {
@@ -428,6 +478,7 @@ impl NvdecDecoder {
                 lock: null_mut(),
                 decoder: null_mut(),
                 fmt: None,
+                surfaces: 0,
                 out_w: 0,
                 out_h: 0,
                 surface_h: 0,
@@ -495,7 +546,11 @@ impl NvdecDecoder {
         };
         // SAFETY: p outlives the call; user_data is a Box, so its address is stable.
         let r = unsafe { (self.state.cuvid.create_parser)(&raw mut self.parser, &raw mut p) };
-        self.state.cuda.check("cuvidCreateVideoParser", r)
+        let res = self.state.cuda.check("cuvidCreateVideoParser", r);
+        if res.is_err() {
+            self.parser = null_mut();
+        }
+        res
     }
 
     fn drop_parser(&mut self) {
@@ -512,6 +567,13 @@ impl NvdecDecoder {
         flags: c_ulong,
         pts: Duration,
     ) -> PipeResult<Vec<DecodedFrame>> {
+        // reset() couldn't make a new parser: its error says why, and there is nothing to
+        // parse with
+        if self.parser.is_null() {
+            return Err(self.state.error.take().unwrap_or_else(|| {
+                "NVDEC: no video parser (cuvidCreateVideoParser failed)".into()
+            }));
+        }
         let mut pkt = SourceDataPacket {
             flags,
             payload_size: data.len() as c_ulong,
@@ -547,20 +609,26 @@ fn pick_device(cuda: &Cuda, node: Option<&Path>) -> Result<CuDevice, String> {
     if count <= 0 {
         return Err("CUDA sees no GPUs".into());
     }
-    let want = node.and_then(pci_of_node);
+    // the node's GPU, never just the first one when it can't be told which that is
+    let want = match node {
+        None => None,
+        Some(n) => Some(
+            pci_of_node(n)
+                .as_deref()
+                .and_then(pci_address)
+                .ok_or_else(|| format!("{}: can't find the GPU's PCI address", n.display()))?,
+        ),
+    };
     for i in 0..count {
         let mut dev = 0;
         // SAFETY: the index is within count.
         cuda.check("cuDeviceGet", unsafe { (cuda.device_get)(&raw mut dev, i) })?;
-        let Some(want) = &want else { return Ok(dev) };
+        let Some(want) = want else { return Ok(dev) };
         let mut buf = [0 as c_char; 32];
         // SAFETY: 32-byte buffer; the function writes a C string no longer than len.
         if unsafe { (cuda.device_get_pci_bus_id)(buf.as_mut_ptr(), buf.len() as c_int, dev) } == 0 {
-            let id = unsafe { CStr::from_ptr(buf.as_ptr()) }
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            // CUDA writes the domain with 8 digits (00000000:01:00.0), sysfs with 4
-            if id.ends_with(want.as_str()) || want.ends_with(id.trim_start_matches('0')) {
+            let id = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+            if pci_address(&id) == Some(want) {
                 return Ok(dev);
             }
         }
@@ -614,23 +682,23 @@ impl State {
     }
 
     fn sequence(&mut self, f: &VideoFormat) -> Result<c_int, String> {
-        let surfaces = c_int::from(f.min_num_decode_surfaces.max(1)) + 2;
-        if let Some(old) = &self.fmt
-            && old.coded_width == f.coded_width
-            && old.coded_height == f.coded_height
-            && old.chroma_format == f.chroma_format
-            && old.bit_depth_luma_minus8 == f.bit_depth_luma_minus8
+        if let Some(n) = self
+            .fmt
+            .as_ref()
+            .and_then(|old| reuse(old, self.surfaces, f))
         {
-            return Ok(surfaces);
+            // the colour description may have changed on its own
+            self.fmt = Some(*f);
+            return Ok(n);
         }
         if f.chroma_format != CHROMA_420 && f.chroma_format != CHROMA_MONO {
             return Err("the plugin's NVDEC path supports 4:2:0 only".into());
         }
         self.destroy_decoder();
 
+        let surfaces = surfaces_for(f);
         let area = f.display_area;
-        let w = (area.right - area.left).max(1) as u32;
-        let h = (area.bottom - area.top).max(1) as u32;
+        let (w, h) = target_size(&area);
         let high = f.bit_depth_luma_minus8 > 0;
         let mut info = DecodeCreateInfo {
             width: c_ulong::from(f.coded_width),
@@ -672,6 +740,7 @@ impl State {
         })?;
         self.decoder = dec;
         self.fmt = Some(*f);
+        self.surfaces = surfaces;
         self.out_w = w;
         self.out_h = h;
         self.surface_h = h;
@@ -934,6 +1003,137 @@ mod tests {
         if cfg!(target_pointer_width = "64") {
             assert_eq!(size_of::<Memcpy2D>(), 128);
         }
+    }
+
+    #[test]
+    fn pci_addresses_match_by_value() {
+        let cuda = pci_address("00000000:01:00.0");
+        assert_eq!(cuda, Some((0, 1, 0, 0)));
+        assert_eq!(
+            pci_address("0000:01:00.0"),
+            cuda,
+            "sysfs writes the domain with 4 digits"
+        );
+        assert_eq!(pci_address("0000:0A:1f.7\n"), Some((0, 10, 31, 7)));
+        // the same bus in another PCI domain is another GPU
+        assert_ne!(pci_address("0001:01:00.0"), cuda);
+        assert_ne!(pci_address("10000:01:00.0"), cuda);
+        assert_eq!(pci_address("10000:e1:00.0"), Some((0x10000, 0xe1, 0, 0)));
+        for bad in [
+            "",
+            "01:00.0",
+            "0000:01:00",
+            "0000:01:00.0:1",
+            "card1",
+            "fd5000000.gpu",
+        ] {
+            assert_eq!(pci_address(bad), None, "{bad}");
+        }
+    }
+
+    /// `gpu_device` may be a link (/dev/dri/by-path/...): it is the same GPU as its node.
+    /// Only looks the node up in sysfs, never opens it. The first node need not be a PCI
+    /// device (an SoC GPU on aarch64 is a platform device): the link leads to it all the same.
+    #[test]
+    fn a_link_to_a_render_node_is_that_node() {
+        assert_eq!(pci_of_node(Path::new("/nonexistent/renderD128")), None);
+        assert!(!node_is_nvidia(Path::new("/nonexistent/renderD128")));
+        let Some(node) = std::fs::read_dir("/dev/dri").ok().and_then(|d| {
+            d.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("renderD"))
+            })
+        }) else {
+            return;
+        };
+        let Some(pci) = pci_of_node(&node) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nsc-nvdec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("pci-render");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&node, &link).unwrap();
+        assert_eq!(pci_of_node(&link), Some(pci));
+        assert_eq!(node_is_nvidia(&link), node_is_nvidia(&node));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn format() -> VideoFormat {
+        VideoFormat {
+            codec: CODEC_H264,
+            frame_rate: [30, 1],
+            progressive_sequence: 1,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            min_num_decode_surfaces: 5,
+            coded_width: 1920,
+            coded_height: 1088,
+            display_area: Rect32 {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            chroma_format: CHROMA_420,
+            bitrate: 0,
+            display_aspect_ratio: [16, 9],
+            video_signal_description: [0, 1, 1, 1],
+            seqhdr_data_length: 0,
+        }
+    }
+
+    #[test]
+    fn a_new_sequence_keeps_the_decoder_only_when_it_still_fits() {
+        let old = format();
+        let made = surfaces_for(&old);
+        assert_eq!(made, 7);
+        // the same stream again (a loop: a fresh parser asks with a single surface)
+        assert_eq!(reuse(&old, made, &old), Some(made));
+        // only the colour description changed
+        let mut f = format();
+        f.video_signal_description = [0b1000, 9, 16, 9];
+        assert_eq!(reuse(&old, made, &f), Some(made));
+        // fewer surfaces needed: the parser still gets what the decoder has
+        f.min_num_decode_surfaces = 2;
+        assert_eq!(reuse(&old, made, &f), Some(made));
+        // more than the decoder has: a parser index could run past its surfaces
+        let mut f = format();
+        f.min_num_decode_surfaces = 6;
+        assert_eq!(reuse(&old, made, &f), None);
+        // another crop of the same coded size
+        let mut f = format();
+        f.display_area.bottom = 1088;
+        assert_eq!(reuse(&old, made, &f), None);
+        let mut f = format();
+        f.bit_depth_chroma_minus8 = 2;
+        assert_eq!(reuse(&old, made, &f), None);
+        let mut f = format();
+        f.progressive_sequence = 0;
+        assert_eq!(reuse(&old, made, &f), None);
+        let mut f = format();
+        f.coded_width = 1280;
+        assert_eq!(reuse(&old, made, &f), None);
+    }
+
+    #[test]
+    fn frames_come_out_at_an_even_size() {
+        let area = |right, bottom| Rect32 {
+            left: 0,
+            top: 0,
+            right,
+            bottom,
+        };
+        assert_eq!(target_size(&area(1920, 1080)), (1920, 1080));
+        assert_eq!(target_size(&area(853, 479)), (854, 480));
+        let cropped = Rect32 {
+            left: 3,
+            top: 2,
+            right: 640,
+            bottom: 359,
+        };
+        assert_eq!(target_size(&cropped), (638, 358));
+        assert_eq!(target_size(&area(0, -4)), (2, 2));
     }
 
     #[test]

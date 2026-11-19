@@ -2,7 +2,8 @@
 //!
 //! Shared by all CPU paths: dav1d/rav1d (I420/I422/I444/I400, 8–12 bit),
 //! openh264 (I420), libvpx (I420/I444), NVDEC and VA-API with a copy to system
-//! memory (NV12/P016). Fixed-point integer math (14 bit).
+//! memory (NV12/P016). Fixed-point integer math (14 bit). Pictures stored as G, B and R
+//! planes (VP9 sRGB, AV1 identity) take the same path without a matrix.
 //!
 //! A decoder keeps one [`Converter`] for its frames:
 //! - samples above 8 bit are first cut down to 8 bit, so one set of kernels does the rest;
@@ -21,6 +22,9 @@ pub enum Matrix {
     Bt601,
     Bt709,
     Bt2020,
+    /// No matrix: the three planes hold G, B and R as they are (VP9 sRGB, matrix 0 of
+    /// H.273 / AV1). Limited range scales all three like luma.
+    Identity,
 }
 
 impl Matrix {
@@ -33,12 +37,13 @@ impl Matrix {
         }
     }
 
-    /// Coefficients (Kr, Kb).
-    fn kr_kb(self) -> (f64, f64) {
+    /// Coefficients (Kr, Kb); `None` for [`Matrix::Identity`].
+    fn kr_kb(self) -> Option<(f64, f64)> {
         match self {
-            Matrix::Bt601 => (0.299, 0.114),
-            Matrix::Bt709 => (0.2126, 0.0722),
-            Matrix::Bt2020 => (0.2627, 0.0593),
+            Matrix::Bt601 => Some((0.299, 0.114)),
+            Matrix::Bt709 => Some((0.2126, 0.0722)),
+            Matrix::Bt2020 => Some((0.2627, 0.0593)),
+            Matrix::Identity => None,
         }
     }
 }
@@ -119,12 +124,13 @@ struct Coefs {
     gu: i32,
     gv: i32,
     bu: i32,
+    /// [`Matrix::Identity`]: y, u and v are G, B and R, each scaled like luma. Only the
+    /// scalar code does this.
+    identity: bool,
 }
 
 impl Coefs {
     fn new(matrix: Matrix, full: bool) -> Self {
-        let (kr, kb) = matrix.kr_kb();
-        let kg = 1.0 - kr - kb;
         // luma and chroma scale for limited range
         let (ys, cs, yo) = if full {
             (1.0, 1.0, 0)
@@ -133,6 +139,18 @@ impl Coefs {
         };
         let one = f64::from(1 << FIX);
         let r = |v: f64| (v * one).round() as i32;
+        let Some((kr, kb)) = matrix.kr_kb() else {
+            return Self {
+                y_off: yo,
+                y_mul: r(ys),
+                rv: 0,
+                gu: 0,
+                gv: 0,
+                bu: 0,
+                identity: true,
+            };
+        };
+        let kg = 1.0 - kr - kb;
         Self {
             y_off: yo,
             y_mul: r(ys),
@@ -140,16 +158,21 @@ impl Coefs {
             gu: r(2.0 * (1.0 - kb) * kb / kg * cs),
             gv: r(2.0 * (1.0 - kr) * kr / kg * cs),
             bu: r(2.0 * (1.0 - kb) * cs),
+            identity: false,
         }
     }
 
     #[inline(always)]
     fn px(&self, y: i32, u: i32, v: i32) -> [u8; 4] {
+        let half = 1 << (FIX - 1);
+        let clamp = |x: i32| ((x + half) >> FIX).clamp(0, 255) as u8;
+        if self.identity {
+            let s = |c: i32| clamp((c - self.y_off) * self.y_mul);
+            return [s(u), s(y), s(v), 255];
+        }
         let y = (y - self.y_off) * self.y_mul;
         let u = u - 128;
         let v = v - 128;
-        let half = 1 << (FIX - 1);
-        let clamp = |x: i32| ((x + half) >> FIX).clamp(0, 255) as u8;
         let r = clamp(y + self.rv * v);
         let g = clamp(y - self.gu * u - self.gv * v);
         let b = clamp(y + self.bu * u);
@@ -777,8 +800,8 @@ impl Converter {
         };
         let c = Coefs::new(img.matrix, img.full_range);
         let mut buf = pool.take(ow * oh * 4);
-        // the pool only hands out buffers nobody else holds
-        convert8(&img8, &c, Arc::get_mut(&mut buf)?, simd);
+        // the pool only hands out buffers nobody else holds; the AVX2 kernel knows matrices only
+        convert8(&img8, &c, Arc::get_mut(&mut buf)?, simd && !c.identity);
         pool.keep(&buf);
         Some(CpuFrame::from_bgra(
             u32::try_from(ow).ok()?,
@@ -1049,6 +1072,8 @@ mod tests {
                         (Matrix::Bt601, false),
                         (Matrix::Bt709, true),
                         (Matrix::Bt2020, false),
+                        (Matrix::Identity, true),
+                        (Matrix::Identity, false),
                     ] {
                         seed += 1;
                         let bpp = if depth > 8 { 2 } else { 1 };
@@ -1102,8 +1127,9 @@ mod tests {
                             },
                             uv,
                         };
-                        let what =
-                            format!("{w}x{h} {chroma:?} interleaved={interleaved} {depth} bit");
+                        let what = format!(
+                            "{w}x{h} {chroma:?} interleaved={interleaved} {depth} bit {matrix:?}"
+                        );
                         let want = reference(&img);
                         let scalar = Converter::default().convert_with(&img, false).unwrap();
                         assert_eq!(&*scalar.pixels, &want[..], "scalar, {what}");
@@ -1114,6 +1140,45 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// VP9 sRGB and AV1 identity: the planes are G, B and R, no matrix in between, in
+    /// either range; never the YUV maths with one of the matrices (the AVX2 kernel included).
+    #[test]
+    fn identity_planes_are_green_blue_red() {
+        let solid444 = |g: u8, b: u8, r: u8, full: bool, simd: bool| -> [u8; 4] {
+            let (w, h) = (19, 3);
+            let (gp, bp, rp) = (vec![g; w * h], vec![b; w * h], vec![r; w * h]);
+            let img = YuvImage {
+                width: w as u32,
+                height: h as u32,
+                bit_depth: 8,
+                chroma: Chroma::Full,
+                matrix: Matrix::Identity,
+                full_range: full,
+                y: Plane {
+                    data: &gp,
+                    stride: w,
+                },
+                uv: ChromaPlanes::Planar {
+                    u: Plane {
+                        data: &bp,
+                        stride: w,
+                    },
+                    v: Plane {
+                        data: &rp,
+                        stride: w,
+                    },
+                },
+            };
+            let f = Converter::default().convert_with(&img, simd).unwrap();
+            assert!(f.pixels.chunks(4).all(|p| p == &f.pixels[..4]), "solid");
+            f.pixels[..4].try_into().unwrap()
+        };
+        for simd in [false, has_simd()] {
+            assert_eq!(solid444(128, 192, 48, true, simd), [192, 128, 48, 255]);
+            assert_eq!(solid444(16, 235, 126, false, simd), [255, 0, 128, 255]);
         }
     }
 
