@@ -43,7 +43,8 @@ pub struct Settings {
     /// Specific render node (`/dev/dri/renderD129`). `None` picks one automatically.
     pub gpu_device: Option<PathBuf>,
     /// The GPU the compositor draws with (`gpu::device_of_dev`), if the shim knows it.
-    /// A video decoded on that GPU is shown straight from video memory.
+    /// A video decoded on that GPU is shown straight from video memory, unless its stream
+    /// names the BT.2020 matrix.
     pub compositor: Option<PathBuf>,
 }
 

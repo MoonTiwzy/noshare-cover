@@ -65,7 +65,8 @@ namespace nsc {
         std::chrono::steady_clock::time_point g_pushedAt;
 
         // The GPU the compositor draws with, as the device number of its DRM node (0:
-        // unknown). A video decoded on that GPU is shown straight from video memory.
+        // unknown). A video decoded on that GPU is shown straight from video memory, unless
+        // its stream names the BT.2020 matrix.
         uint64_t compositorDev() {
             if (!g_pCompositor)
                 return 0;

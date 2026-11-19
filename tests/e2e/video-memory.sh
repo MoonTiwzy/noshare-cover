@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# A video decoded on the GPU the compositor draws with is shown straight from video memory
-# (VA-API on Intel and AMD: the GPU's video processor turns each frame into an RGB picture
-# of the size it is shown at, and Hyprland imports it as a texture). The capture must look
-# like the same video decoded on the CPU: same colours, in a large window and in a small one.
+# A video decoded on the GPU the compositor draws with is shown straight from video memory,
+# unless its stream names the BT.2020 matrix (VA-API on Intel and AMD: the GPU's video
+# processor turns each frame into an RGB picture of the size it is shown at, and Hyprland
+# imports it as a texture). The capture must look like the same video decoded on the CPU:
+# same colours, in a large window and in a small one.
 #
 #   tests/e2e/video-memory.sh <libnoshare-cover.so>
 #
