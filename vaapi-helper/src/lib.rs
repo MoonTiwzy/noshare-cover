@@ -711,18 +711,61 @@ mod imp {
     const COLOR_EXPLICIT: u32 = 13;
     // ISO/IEC 23001-8 (H.273) code points
     const PRIMARIES_BT709: u8 = 1;
+    const PRIMARIES_BT470BG: u8 = 5;
     const TRANSFER_BT709: u8 = 1;
 
+    /// The primaries named on both sides of the video processor for a frame with this
+    /// YCbCr `matrix`. Asked for explicit colours, Intel's iHD (VpSetColorStandardExplictly)
+    /// and AMD's VPE (si_vpe.c, which Mesa 26.2 still tries before its shader compositor)
+    /// take the matrix from the primaries, not from matrix_coefficients. So a BT.601 frame
+    /// names BT.470 BG, the BT.601 code both of them read (iHD doesn't know SMPTE 170M and
+    /// would drop full range for it), and the rest BT.709. The output names the same: a
+    /// driver that is told two different ones maps one gamut to the other (Mesa's
+    /// compositor does), which the CPU path doesn't. Mesa's compositor before 26.2 uses
+    /// BT.709 for any explicit colours, whatever the primaries: a BT.601 frame still comes
+    /// out with the BT.709 matrix there.
+    fn primaries_for(matrix: u8) -> u8 {
+        if matrix == MATRIX_BT601 {
+            PRIMARIES_BT470BG
+        } else {
+            PRIMARIES_BT709
+        }
+    }
+
+    /// What `draw` asks the video processor for: the input's colours as the stream gives
+    /// them (`matrix`, `full_range`) and full-range RGB out, both sides with the same
+    /// primaries and transfer.
+    fn colour_properties(matrix: u8, full_range: bool) -> (ColorProperties, ColorProperties) {
+        let primaries = primaries_for(matrix);
+        let input = ColorProperties {
+            color_range: (if full_range {
+                va::VA_SOURCE_RANGE_FULL
+            } else {
+                va::VA_SOURCE_RANGE_REDUCED
+            }) as u8,
+            colour_primaries: primaries,
+            transfer_characteristics: TRANSFER_BT709,
+            matrix_coefficients: matrix,
+            ..Default::default()
+        };
+        let output = ColorProperties {
+            color_range: va::VA_SOURCE_RANGE_FULL as u8,
+            colour_primaries: primaries,
+            transfer_characteristics: TRANSFER_BT709,
+            matrix_coefficients: MATRIX_RGB,
+            ..Default::default()
+        };
+        (input, output)
+    }
+
     /// Whether a frame with this YCbCr `matrix` (from `Colour::matrix_for`) is given to the
-    /// video processor. A BT.2020 one isn't: asked for explicit colours, Intel's iHD
-    /// (VpSetColorStandardExplictly) and AMD's VPE (si_vpe.c, which Mesa 26.2 still tries
-    /// before its shader compositor) take the matrix from the primaries, which stay BT.709
-    /// in `draw`, and Mesa's compositor before 26.2 uses BT.709 for any explicit colours. The
-    /// frame would come out with the BT.709 matrix there, so it goes through memory and is
-    /// converted on the CPU, as on any other GPU. The driver can't be told from its vendor
-    /// string well enough to keep the ones that get it right (Mesa 26.2 without a VPE).
-    /// BT.601 has the same gap on those drivers; it stays, as it was, with the video
-    /// processor: that is every video under 720 lines that names no matrix.
+    /// video processor. A BT.2020 one isn't: iHD and VPE would take the BT.709 matrix from
+    /// its primaries (see `primaries_for`), and Mesa's compositor before 26.2 uses BT.709
+    /// for any explicit colours. So it goes through memory and is converted on the CPU, as
+    /// on any other GPU. The driver can't be told from its vendor string well enough to
+    /// keep the ones that get it right (Mesa 26.2 without a VPE). A BT.601 frame stays with
+    /// the video processor, which reads it from its primaries: that is every video under 720
+    /// lines that names no matrix.
     fn vpp_takes(matrix: u8) -> bool {
         matrix != MATRIX_BT2020
     }
@@ -920,27 +963,13 @@ mod imp {
             // primaries and the transfer curve of BT.601 to those of the output), and the
             // same video would look different depending on where it was decoded. So both
             // sides are spelled out with the same primaries and transfer. (Not every driver
-            // reads the matrix from here; see vpp_takes for the frames kept away from it.)
+            // reads the matrix from matrix_coefficients: see primaries_for, and vpp_takes
+            // for the frames kept away from it.)
+            let (input, output) = colour_properties(matrix, full_range);
             p.surface_color_standard = COLOR_EXPLICIT;
-            p.input_color_properties = ColorProperties {
-                color_range: (if full_range {
-                    va::VA_SOURCE_RANGE_FULL
-                } else {
-                    va::VA_SOURCE_RANGE_REDUCED
-                }) as u8,
-                colour_primaries: PRIMARIES_BT709,
-                transfer_characteristics: TRANSFER_BT709,
-                matrix_coefficients: matrix,
-                ..Default::default()
-            };
+            p.input_color_properties = input;
             p.output_color_standard = COLOR_EXPLICIT;
-            p.output_color_properties = ColorProperties {
-                color_range: va::VA_SOURCE_RANGE_FULL as u8,
-                colour_primaries: PRIMARIES_BT709,
-                transfer_characteristics: TRANSFER_BT709,
-                matrix_coefficients: MATRIX_RGB,
-                ..Default::default()
-            };
+            p.output_color_properties = output;
             let mut buf: va::VABufferID = 0;
             // SAFETY: the driver copies `p` (and what it points to is alive) within the calls;
             // the buffer is destroyed whether rendering worked or not.
@@ -1511,6 +1540,48 @@ mod imp {
                 (12, 480),
             ] {
                 assert!(vpp_takes(c(m).matrix_for(h)), "{m} at {h} lines");
+            }
+        }
+
+        /// A BT.601 frame names the BT.601 primaries iHD and VPE take its matrix from, the
+        /// rest BT.709; input and output always name the same, so no driver maps gamuts.
+        #[test]
+        fn the_primaries_name_the_matrix_on_both_sides() {
+            for (matrix, primaries) in [
+                (MATRIX_BT601, 5),
+                (MATRIX_BT709, 1),
+                (MATRIX_RGB, 1),
+                (MATRIX_BT2020, 1), // never drawn (vpp_takes)
+            ] {
+                for full_range in [false, true] {
+                    let (input, output) = colour_properties(matrix, full_range);
+                    assert_eq!(input.colour_primaries, primaries, "{matrix}");
+                    assert_eq!(output.colour_primaries, primaries, "{matrix}");
+                    assert_eq!(input.matrix_coefficients, matrix);
+                    assert_eq!(output.matrix_coefficients, MATRIX_RGB);
+                    assert_eq!(
+                        input.transfer_characteristics,
+                        output.transfer_characteristics
+                    );
+                    let range = if full_range {
+                        va::VA_SOURCE_RANGE_FULL
+                    } else {
+                        va::VA_SOURCE_RANGE_REDUCED
+                    };
+                    assert_eq!(u32::from(input.color_range), range);
+                    assert_eq!(u32::from(output.color_range), va::VA_SOURCE_RANGE_FULL);
+                }
+            }
+            // every matrix a stream can end up with gets one of the two
+            for m in [0, 1, 2, 5, 6, 7, 9, 10, 12, 255] {
+                for h in [360, 1080] {
+                    let matrix = Colour {
+                        matrix: m,
+                        full_range: false,
+                    }
+                    .matrix_for(h);
+                    assert!(matches!(primaries_for(matrix), 1 | 5), "{m} at {h} lines");
+                }
             }
         }
 

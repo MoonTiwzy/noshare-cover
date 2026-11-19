@@ -126,7 +126,8 @@ picture belongs to its frame until the frame is dropped, then its token goes bac
 helper with the next packet. The colours, which the helper reads from the stream's headers
 (a stream that names no matrix gets BT.709 from 720 lines up, BT.601 below), are given to
 the VPP explicitly (matrix and range only, same primaries and transfer on both sides), so the
-result matches the pixel path.
+result matches the pixel path. iHD and VPE take the matrix from the primaries, so a BT.601
+frame names BT.601 primaries; Mesa's compositor before 26.2 still converts it with BT.709.
 NVDEC keeps copying: its frames can't be exported as dma-bufs.
 
 ## Coexisting with other plugins
