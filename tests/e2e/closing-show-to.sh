@@ -129,9 +129,10 @@ for i in 1 2 3; do
 done
 
 # a foot window titled "SECRET page" until $WORK/switch-N appears, then "normal page"
-open_tab() { # $1: N; sets BOX
+open_tab() { # $1: N; sets BOX and TAB_PID (the foot it runs in)
     rm -f "$WORK/switch-$1"
     foot --app-id tabs sh -c "printf '\033]2;SECRET page\007'; while [ ! -f $WORK/switch-$1 ]; do sleep 0.02; done; printf '\033]2;normal page\007'; while :; do date; sleep 0.2; done" >/dev/null 2>&1 &
+    TAB_PID=$!
     for _ in $(seq 40); do sleep 0.25; [ "$(title)" = "SECRET page" ] && break; done
     sleep 0.5
     BOX=$(win_box tabs)
@@ -140,8 +141,8 @@ switch_tab() { # $1: N
     touch "$WORK/switch-$1"
     for _ in $(seq 50); do [ "$(title)" = "normal page" ] && break; sleep 0.01; done
 }
-close_tab() { # $1: N
-    pkill -f "switch-$1" 2>/dev/null
+close_tab() {
+    kill "$TAB_PID" 2>/dev/null
     for _ in $(seq 20); do [ -z "$(win_box tabs)" ] && break; sleep 0.1; done
     settle
 }
@@ -154,14 +155,14 @@ for i in 1 2 3; do
     check "$WORK/grim-share" "c$i-share" "$BOX" content "run $i: grim-share while the title matches"
     switch_tab "$N"
     check grim "c$i-held" "$BOX" cover "run $i: grim right after the switch, a grim-share shot in between"
-    close_tab "$N"
+    close_tab
 done
 for i in 1 2 3; do
     N=$((N + 1)); open_tab "$N"
     check grim "d$i-hidden" "$BOX" cover "run $i: grim while the title matches"
     switch_tab "$N"
     check "$WORK/grim-share" "d$i-share" "$BOX" content "run $i: grim-share right after the switch gets no hold"
-    close_tab "$N"
+    close_tab
 done
 
 echo "== show_to with a full path"

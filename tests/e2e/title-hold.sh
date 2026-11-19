@@ -44,12 +44,14 @@ is_cover() { read -r r g b <<<"$1"; [ "$r" -gt 100 ] && [ "$b" -gt 200 ]; }
 title() { hctl clients -j | jq -r '.[] | select(.class == "tabs") | .title' | head -1; }
 
 # a foot window titled "SECRET page" until $WORK/switch-N appears, then "normal page"; with
-# $2 = still it draws nothing after that (no cursor, no output): only the plugin repaints it
+# $2 = still it draws nothing after that (no cursor, no output): only the plugin repaints it.
+# TAB_PID: the foot it runs in
 open_tab() { # $1: N, $2: still (optional)
     rm -f "$WORK/switch-$1"
     local after='while :; do date; sleep 0.2; done'
     [ "${2:-}" = still ] && after='sleep 1000'
     foot --app-id tabs sh -c "printf '\033[?25l\033]2;SECRET page\007'; while [ ! -f $WORK/switch-$1 ]; do sleep 0.02; done; printf '\033]2;normal page\007'; $after" >/dev/null 2>&1 &
+    TAB_PID=$!
     for _ in $(seq 40); do sleep 0.25; [ "$(title)" = "SECRET page" ] && break; done
     sleep 0.5
 }
@@ -91,7 +93,7 @@ run_case() {
     sleep 2
     grim "$WORK/later.png"
     c=$(mean_rgb later "$box"); is_cover "$c" && fail "$4: still covered 2 s later ($c)" || pass "$4: shown after the hold ($c)"
-    pkill -f "switch-$N" 2>/dev/null
+    kill "$TAB_PID" 2>/dev/null
     for _ in $(seq 20); do [ -z "$(win_box tabs)" ] && break; sleep 0.1; done
 }
 
@@ -128,7 +130,7 @@ else
 fi
 grep -aq "pump: hold over, window repainted" "$WORK/trace.log" && pass "still screen: repainted when the hold was over (trace)" ||
     fail "still screen: no repaint when the hold was over ($WORK/trace.log)"
-pkill -f "switch-$N" 2>/dev/null
+kill "$TAB_PID" 2>/dev/null
 
 pkill -xu "$(id -u)" Hyprland
 echo
