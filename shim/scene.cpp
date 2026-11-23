@@ -117,7 +117,7 @@ namespace nsc {
                 const auto          now      = Time::steadyNow();
                 Render::CMonitorScene{mon}.draw(ctx, now);
                 // a software cursor is drawn into the frame, so the mirror image has it; here
-                // only for a capture that asked for the cursor
+                // for a capture that asked for the cursor or mirrors that picture (a stream)
                 if (cursor && g_pHyprRenderer->shouldRenderCursor()) {
                     CRegion damage = full;
                     Pointer::mgr()->renderSoftwareCursorsFor(ctx, mon, now, damage);
@@ -149,7 +149,7 @@ namespace nsc {
     // cursor: the image has the software cursor. Hyprland's picture of the monitor always
     // does, also in a capture that didn't ask for the cursor: there it is everywhere but
     // over the covers, unless it is drawn here too. The scene without transparent surfaces
-    // has it only for a capture that asked.
+    // has it for a capture that asked and for one by a client that sees no hidden surface.
     void cursorOverCovers(Render::CRenderContext& ctx, const PHLMONITOR& mon, const Vector2D& capturePos, bool cursor) {
         if (!cursor || !g_cfgCursorOverCovers || !g_cfgCursorOverCovers->value() || g_painted.empty() || !Pointer::mgr()->softwareLockedFor(mon) ||
             !g_pHyprRenderer->shouldRenderCursor())

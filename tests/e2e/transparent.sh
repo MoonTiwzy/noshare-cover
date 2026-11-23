@@ -28,8 +28,8 @@ hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "1" })
 hl.plugin.load("$PLUGIN")
 hl.config({
     -- the cursor is looked at only in its own section (the one with no_hardware_cursors).
-    -- Elsewhere a capture is compared with the screen without the transparent surface: the
-    -- scene has no cursor for grim, so the covers of the other shot don't get one either
+    -- Elsewhere a capture is compared with the screen without the transparent surface, so
+    -- the covers must not add a cursor of their own
     plugin = { no_screen_share_cover = { path_cover = "$1", cursor_over_covers = $([ -n "${4:-}" ] && echo true || echo false) } },
     general = { gaps_in = 0, gaps_out = 0, border_size = 0, layout = "dwindle" },
     decoration = { rounding = 0, shadow = { enabled = false }, blur = { enabled = ${3:-false}, ignore_opacity = true } },
@@ -239,8 +239,9 @@ check_frame "under a blurred translucent window" blur blur-after
 
 echo "== software cursor (no_hardware_cursors = 1)"
 # Hyprland's picture of the monitor has the software cursor whatever the capture asked for,
-# so it is drawn over a cover in any capture. The transparent scene is drawn for the capture
-# alone: there the cursor is only for a capture that asks for it (grim -c).
+# so it is drawn over a cover in any capture, and the transparent scene, which stands in for
+# that picture, has it too. Only a client that sees hidden surfaces as they are (show_to) gets
+# the scene without a cursor it didn't ask for; grim is no such client here.
 write_config "$WORK/cover.png" 1 false 1
 start_hyprland
 open_win plain
@@ -253,7 +254,7 @@ cursor_px() { # $1 shot, $2 reference, $3 $4 pointer: "<count> <bbox>" of the pi
         -colorspace gray -threshold 6% -format '%[fx:int(mean*w*h+0.5)] %@' info: 2>/dev/null # no bbox when nothing differs
 }
 # $5 unasked: what a capture that didn't ask for the cursor has there. "there": the software
-# cursor, as in the rest of Hyprland's picture of the monitor; "none": the scene leaves it out
+# cursor, as in the rest of Hyprland's picture of the monitor; "none": it is left out
 check_cursor() { # $1 label, $2 reference, $3 $4 pointer, $5 unasked; takes both shots there
     local n box w h
     grim "$WORK/nocursor.png"
@@ -288,7 +289,7 @@ if command -v quickshell >/dev/null; then
         park
         shot ref-cursor-layer
         point "$cx" "$cy"
-        check_cursor "cursor over a transparent layer" ref-cursor-layer "$cx" "$cy" none
+        check_cursor "cursor over a transparent layer" ref-cursor-layer "$cx" "$cy" there
     else
         fail "the quickshell layer didn't map ($WORK/qs-cursor.log)"
     fi

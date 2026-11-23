@@ -179,9 +179,11 @@ capture asked for was always on top.
 
 Hyprland's picture of the monitor has the software cursor also for a capture that didn't ask
 for it (a Discord stream, `grim` without `-c`), so over the covers it is drawn in such a capture
-too: otherwise the cursor would be everywhere but over them. Only the transparent scene, which
-is drawn for the capture alone, leaves the cursor out unless the client asked for it (`grim -c`,
-a stream with the cursor embedded). The scene buffers
+too: otherwise the cursor would be everywhere but over them. The transparent scene, which is
+drawn for the capture alone, has it as well, so a stream does not lose its cursor while a
+transparent surface is shown. Only for a client that sees hidden surfaces as they are (`show_to`:
+a screenshot tool, a shell's own captures) the scene leaves the cursor out unless that client
+asked for it (`grim -c`). The scene buffers
 (about 30 MB for a 2560x1440 monitor: the picture and its stencil, which blur under a layer
 with `ignore_alpha` needs; 15 MB more under cursor zoom) are freed 10 s after the
 last capture that needed them.

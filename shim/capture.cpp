@@ -238,15 +238,23 @@ namespace nsc {
         void renderMonitorWithCovers(Screenshare::CScreenshareFrame* self, Render::CRenderContext& ctx, const F& original, const SCaptureClient& client,
                                      const std::unordered_set<uintptr_t>& revealedKeys) {
             g_painted = CRegion{};
-            bool                 left = false;
+            bool                 left   = false;
+            bool                 cursor = self && self->m_overlayCursor; // the scene has the software cursor
             SP<Render::ITexture> image; // what Hyprland draws the frame from, for blur and pixelate
             {
                 std::optional<CSceneSwap> scene;
                 const auto                mon = ctx.m_data.pMonitor.lock();
                 if (mon && self && self->m_session) {
                     const auto gone = transparentOn(mon, self->m_session->m_captureBox.pos(), client);
-                    if (!gone.keys.empty() || gone.closing)
-                        left = scene.emplace(ctx, mon, gone.keys, self->m_overlayCursor).drawn();
+                    if (!gone.keys.empty() || gone.closing) {
+                        // Hyprland's picture of the monitor has a software cursor whatever the
+                        // capture asked for, and the scene stands in for that picture: without the
+                        // cursor a stream that didn't ask (Discord) would lose it for as long as a
+                        // transparent surface is shown. A client that sees hidden surfaces as they
+                        // are (a screenshot tool, a shell's own captures) gets what it asked for.
+                        cursor = cursor || !client.sees(SRuleValues{});
+                        left   = scene.emplace(ctx, mon, gone.keys, cursor).drawn();
+                    }
                 }
                 if (mon && !mon->resources().expired())
                     image = mon->resources()->getMirrorTexture(); // the scene, if it was swapped in
@@ -260,8 +268,8 @@ namespace nsc {
             paintCovers(ctx, self, client, revealedKeys, left, image);
             if (const auto mon = ctx.m_data.pMonitor.lock(); mon && self && self->m_session)
                 // the monitor's own picture has a software cursor whatever the capture asked
-                // for; the scene drawn in its place only for a capture that asked
-                cursorOverCovers(ctx, mon, self->m_session->m_captureBox.pos(), self->m_overlayCursor || !left);
+                // for; the scene drawn in its place has it as decided above
+                cursorOverCovers(ctx, mon, self->m_session->m_captureBox.pos(), cursor || !left);
         }
 
         // A capture into a client's dmabuf (portal streams: Discord, OBS) renders straight into a
